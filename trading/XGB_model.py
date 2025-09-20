@@ -14,8 +14,8 @@ def rmse_scorer(y_true, y_pred):
 
 # Load data
 print("Loading data...")
-train_df = pd.read_csv('../research/data/train.csv')
-test_df = pd.read_csv('../research/data/test.csv')
+train_df = pd.read_csv('research/data/train.csv')
+test_df = pd.read_csv('research/data/test.csv')
 
 # Prepare features
 feature_cols = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N']
