@@ -190,7 +190,7 @@ def fit_base_models_get_oof_and_test(
 
         # quick fold metrics
         y_va_pred = lgb_base.predict(X_va)
-        print(f"[fold {fold}] LGB RMSE Y1={rmse(y_va['Y1'], y_va_pred[:,0]):.4f}  Y2={rmse(y_va['Y2'], y_va_pred[:,1])::.4f}")
+        print(f"[fold {fold}] LGB RMSE Y1={rmse(y_va['Y1'], y_va_pred[:,0]):.4f}  Y2={rmse(y_va['Y2'], y_va_pred[:,1]):.4f}")
 
     # average test preds across folds
     test_xgb = np.mean(test_preds_xgb, axis=0)
