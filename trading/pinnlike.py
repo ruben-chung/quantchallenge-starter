@@ -260,14 +260,14 @@ def train_loop(
     # Progress Bar
     # =============================
     tr_sum, n_tr = 0.0, 0
-    pbar = tqdm(dl_tr, desc="Training", unit="batch")
+    pbar_train = tqdm(dl_tr, desc="Training", unit="batch")
 
     for ep in range(1, epochs + 1):
         # ---------------- Train (reconstruction) ----------------
         model_f.train()
         tr_sum, n_tr = 0.0, 0
 
-        for x0, t0, x1, t1, dt in pbar:
+        for x0, t0, x1, t1, dt in pbar_train:
             x0, x1 = x0.to(device), x1.to(device)
             t0, t1, dt = t0.to(device), t1.to(device), dt.to(device)
 
@@ -294,17 +294,18 @@ def train_loop(
             n_tr += bs
 
             tr_loss = tr_sum / max(1, n_tr)
-            pbar.set_postfix(loss=f"{tr_loss:.4f}")
-        pbar.close()
+            pbar_train.set_postfix(loss=f"{tr_loss:.4f}")
+        pbar_train.close()
 
         print("training done, starting validation...")
 
         # ---------------- Validation (future prediction ONLY) ----------------
         model_f.eval()
         va_sum, n_va = 0.0, 0
+        pbar_val = tqdm(dl_va, desc="Validating", unit="batch")
+
         with torch.no_grad():
-            pbar = tqdm(dl_va, desc="Validating", unit="batch")
-            for x_start, t_start, dt_seq, x_future in pbar:
+            for x_start, t_start, dt_seq, x_future in pbar_val:
                 # Expected shapes:
                 # x_start : [B, D]
                 # t_start : [B]
@@ -332,8 +333,8 @@ def train_loop(
                 n_va += B * H
 
                 va_loss = va_sum / max(1, n_va)
-                pbar.set_postfix(loss=f"{va_loss:.4f}")
-        pbar.close()
+                pbar_val.set_postfix(loss=f"{va_loss:.4f}")
+        pbar_val.close()
 
         va_loss = va_sum / max(1, n_va)
         sched.step(va_loss)
