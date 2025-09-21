@@ -386,32 +386,35 @@ def train_loop(
         pbar_val = tqdm(dl_va, desc="Validating", unit="batch", leave=False)
         with torch.no_grad():
             for x_start, t_start, dt_seq, x_future, y_future in pbar_val:
-                # Expected shapes:
-                # x_start : [B, D]
+                # Shapes:
+                # x_start : [B, D]          (unused here except for time base)
                 # t_start : [B]
                 # dt_seq  : [B, H]
-                # x_future: [B, H, D]
-                # y_future: [B, H, 2]
+                # x_future: [B, H, D]       (ground-truth X window)
+                # y_future: [B, H, 2]       (ground-truth Y window)
+
                 B, H, D = x_future.shape
+                x_future = x_future.to(device)         # [B, H, D]
+                y_gt     = y_future.to(device)         # [B, H, 2]
+                t0       = t_start.to(device).view(B, 1)   # [B, 1]
+                dt_seq   = dt_seq.to(device)               # [B, H]
 
-                x = x_start.to(device)                 # [B, D]
-                t = t_start.to(device).view(B, 1)      # [B, 1]
-                dt_seq = dt_seq.to(device)             # [B, H]
-                y_gt = y_future.to(device)             # [B, H, 2]
+                # Reconstruct absolute times for each future step: t_h = t0 + cumsum(dt_seq)
+                t_abs = t0 + torch.cumsum(dt_seq, dim=1)   # [B, H]
 
+                # Predict Y directly from ground-truth X at corresponding absolute times
+                # Build a list then stack to [B, H, 2]
                 y_preds = []
                 for h in range(H):
-                    dt_h = dt_seq[:, h].view(B, 1)          # [B, 1]
-                    x = rk4_step(x, t, dt_h, model_f)       # [B, D]
-                    t = t + dt_h                            # [B, 1]
-                    y_hat_h = readout(x, t.view(B))         # [B, 2]
-                    y_preds.append(y_hat_h.unsqueeze(1))    # [B, 1, 2]
-
-                y_preds = torch.cat(y_preds, dim=1)         # [B, H, 2]
+                    x_h = x_future[:, h, :]               # [B, D]
+                    t_h = t_abs[:, h]                     # [B]
+                    y_hat_h = readout(x_h, t_h)           # [B, 2]
+                    y_preds.append(y_hat_h.unsqueeze(1))  # [B, 1, 2]
+                y_preds = torch.cat(y_preds, dim=1)       # [B, H, 2]
 
                 batch_loss = F.mse_loss(y_preds, y_gt, reduction="sum")
                 va_sum += batch_loss.item()
-                n_va += B * H
+                n_va   += B * H
 
                 pbar_val.set_postfix(loss=f"{va_sum / max(1, n_va):.4f}")
         pbar_val.close()
