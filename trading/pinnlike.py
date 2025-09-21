@@ -21,6 +21,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+from tqdm import tqdm
+
+
+
+
 
 
 # =============================
@@ -234,6 +239,7 @@ def train_loop(
     w_cycle: float = 0.5,
     patience: int = 30,
 ):
+ 
     """
     Train with reconstruction losses on consecutive pairs.
     Validate ONLY by multi-step future prediction (rollouts).
@@ -250,12 +256,18 @@ def train_loop(
     best_val = float("inf")
     patience_ct = 0
 
+    # =============================
+    # Progress Bar
+    # =============================
+    tr_sum, n_tr = 0.0, 0
+    pbar = tqdm(dl_tr, desc="Training", unit="batch")
+
     for ep in range(1, epochs + 1):
         # ---------------- Train (reconstruction) ----------------
         model_f.train()
         tr_sum, n_tr = 0.0, 0
 
-        for x0, t0, x1, t1, dt in dl_tr:
+        for x0, t0, x1, t1, dt in pbar:
             x0, x1 = x0.to(device), x1.to(device)
             t0, t1, dt = t0.to(device), t1.to(device), dt.to(device)
 
@@ -281,20 +293,25 @@ def train_loop(
             tr_sum += loss.item() * bs
             n_tr += bs
 
-        tr_loss = tr_sum / max(1, n_tr)
+            tr_loss = tr_sum / max(1, n_tr)
+            pbar.set_postfix(loss=f"{tr_loss:.4f}")
+        pbar.close()
+
+        print("training done, starting validation...")
 
         # ---------------- Validation (future prediction ONLY) ----------------
         model_f.eval()
         va_sum, n_va = 0.0, 0
         with torch.no_grad():
-            for x_start, t_start, dt_seq, x_future in dl_va:
+            pbar = tqdm(dl_va, desc="Validating", unit="batch")
+            for x_start, t_start, dt_seq, x_future in pbar:
                 # Shapes with batch_size=1:
                 # x_start : [1, D]     t_start : [1]
                 # dt_seq  : [1, H]     x_future: [1, H, D]
                 x = x_start.to(device)                 # [1, D]
                 t = t_start.to(device).view(-1)        # [1]
                 dt_seq = dt_seq.to(device).view(-1)    # [H]
-                gt = x_future.to(device).squeeze(0)    # [H, D]  <-- now H matches preds
+                gt = x_future.to(device).squeeze(0)    # [H, D]
 
                 preds = []
                 for h in range(dt_seq.shape[0]):
@@ -306,6 +323,9 @@ def train_loop(
 
                 va_sum += F.mse_loss(preds, gt).item() * gt.shape[0]
                 n_va += gt.shape[0]
+
+                va_loss = va_sum / max(1, n_va)
+                pbar.set_postfix(loss=f"{va_loss:.4f}")
 
         va_loss = va_sum / max(1, n_va)
         sched.step(va_loss)
