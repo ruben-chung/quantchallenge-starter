@@ -251,7 +251,7 @@ def train_loop(
 
     dl_tr = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
     # batch_size=1 for per-trajectory rollout; keep shapes consistent
-    dl_va = DataLoader(val_ds, batch_size=1, shuffle=False, drop_last=False)
+    dl_va = DataLoader(val_ds, batch_size=batch_size, shuffle=False, drop_last=False)
 
     best_val = float("inf")
     patience_ct = 0
