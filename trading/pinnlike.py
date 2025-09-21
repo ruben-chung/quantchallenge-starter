@@ -338,7 +338,7 @@ def main():
     depth       = 4
 
     epochs      = 300
-    batch_size  = 128
+    batch_size  = 528
     lr          = 1e-3
     weight_decay= 1e-4
 
@@ -380,6 +380,8 @@ def main():
     # Model
     x_dim = len(STATE_COLS)  # 14
     model_f = DynamicsNet(x_dim=x_dim, hidden=hidden, depth=depth)
+
+    print("training start")
 
     # Train
     train_loop(
