@@ -305,27 +305,35 @@ def train_loop(
         with torch.no_grad():
             pbar = tqdm(dl_va, desc="Validating", unit="batch")
             for x_start, t_start, dt_seq, x_future in pbar:
-                # Shapes with batch_size=1:
-                # x_start : [1, D]     t_start : [1]
-                # dt_seq  : [1, H]     x_future: [1, H, D]
-                x = x_start.to(device)                 # [1, D]
-                t = t_start.to(device).view(-1)        # [1]
-                dt_seq = dt_seq.to(device).view(-1)    # [H]
-                gt = x_future.to(device).squeeze(0)    # [H, D]
+                # Expected shapes:
+                # x_start : [B, D]
+                # t_start : [B]
+                # dt_seq  : [B, H]
+                # x_future: [B, H, D]
+                B, H, D = x_future.shape
+
+                x = x_start.to(device)                 # [B, D]
+                t = t_start.to(device).view(B, 1)      # [B, 1]
+                dt_seq = dt_seq.to(device)             # [B, H]
+                gt = x_future.to(device)               # [B, H, D]
 
                 preds = []
-                for h in range(dt_seq.shape[0]):
-                    dt_h = dt_seq[h].view(1)           # [1]
-                    x = rk4_step(x, t, dt_h, model_f)  # x stays [1, D]
-                    t = t + dt_h                       # [1]
-                    preds.append(x.squeeze(0))         # [D]
-                preds = torch.stack(preds, dim=0)      # [H, D]
+                for h in range(H):
+                    dt_h = dt_seq[:, h].view(B, 1)          # [B, 1]
+                    x = rk4_step(x, t, dt_h, model_f)       # [B, D]
+                    t = t + dt_h                            # [B, 1]
+                    preds.append(x.unsqueeze(1))            # [B, 1, D]
 
-                va_sum += F.mse_loss(preds, gt).item() * gt.shape[0]
-                n_va += gt.shape[0]
+                preds = torch.cat(preds, dim=1)             # [B, H, D]
+
+                # MSE over all elements (sum reduced by H*B for average later)
+                batch_loss = F.mse_loss(preds, gt, reduction="sum")
+                va_sum += batch_loss.item()
+                n_va += B * H
 
                 va_loss = va_sum / max(1, n_va)
                 pbar.set_postfix(loss=f"{va_loss:.4f}")
+        pbar.close()
 
         va_loss = va_sum / max(1, n_va)
         sched.step(va_loss)
