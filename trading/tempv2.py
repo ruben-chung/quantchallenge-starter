@@ -460,7 +460,7 @@ def main():
     parser.add_argument("--lr",        type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--patience",  type=int, default=30)
-    parser.add_argument("--hidden",    type=int, default=128)
+    parser.add_argument("--hidden",    type=int, default=256)
     parser.add_argument("--depth_f",   type=int, default=4)
     parser.add_argument("--depth_g",   type=int, default=3)
     parser.add_argument("--depth_h",   type=int, default=2)
