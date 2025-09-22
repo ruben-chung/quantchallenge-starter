@@ -1,22 +1,29 @@
 # time_pinn_trainer.py
 # ------------------------------------------------------------
 # Train on train.csv (time, A..N, Y1, Y2) with summed-MSE losses,
-# pick the best epoch by VALIDATION SUM-MSE (same-time Y only),
-# and EVERY TIME the validation sum-MSE improves:
-#   -> run current model on test.csv (time, A..N, [id])
-#   -> write predictions to:
+# evaluate validation (same-time Y only) using **summed MSE**,
+# and EVERY TIME validation summed MSE improves:
+#   -> run inference on test.csv (time, A..N)  [id is NOT used even if present]
+#   -> write predictions:
 #        - --out_csv (overwritten each improvement)
-#        - a snapshot: <stem>.best_epoch{ep}_val{val:.6e}.csv
+#        - snapshot: <stem>.best_epoch{ep}_val{val:.6e}.csv
 #
-# IMPORTANT:
-# - No normalization/standardization (raw scale).
-# - Validation uses ONLY ground-truth X and time to predict Y at the SAME step.
-# - We never save model weights; only CSVs are written on improvements.
+# Architecture:
+#   Copied from the provided script:
+#     - DynamicsNet f(x,t)  (SiLU MLP, depth=4 by default)
+#     - NextStepNet g(x,t,dt) (SiLU MLP, depth=3)
+#     - ReadoutNet h(x,t)   (SiLU MLP, depth=2)
+#
+# Notes:
+#   - No normalization/standardization (raw scale).
+#   - We never save model weights; only CSVs are written on improvements.
+#   - Validation uses ONLY ground-truth X and time to predict Y at the SAME step.
+#   - Test output CSV has columns: id, Y1, Y2  where id is 0..N-1 (time-sorted).
 # ------------------------------------------------------------
 
 import os
 import argparse
-from typing import List, Optional
+from typing import List
 
 import numpy as np
 import pandas as pd
@@ -70,20 +77,12 @@ def load_test_csv(path: str) -> pd.DataFrame:
     if not os.path.exists(path):
         raise FileNotFoundError(path)
     df = pd.read_csv(path)
-    require_cols(df, FEATURES, "test.csv")  # Y not required
+    # We explicitly ignore any 'id' column if present.
+    require_cols(df, FEATURES, "test.csv")
     for c in FEATURES:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.dropna(subset=FEATURES).sort_values("time").reset_index(drop=True)
     return df
-
-
-def find_id_column(df: pd.DataFrame) -> Optional[str]:
-    if "id" in df.columns:
-        return "id"
-    for c in df.columns:
-        if c.lower() == "id":
-            return c
-    return None
 
 
 # =============================
@@ -151,34 +150,34 @@ class ValDatasetSameTimeY(Dataset):
 
         x_start = torch.from_numpy(self.x[i]).float()     # [D]
         t_start = torch.tensor(self.t[i]).float()         # []
+
         dt_seq   = torch.from_numpy(np.diff(self.t[i:i+h+1]).astype(np.float32))  # [h]
         x_future = torch.from_numpy(self.x[j:j+h]).float()                        # [h, D]
         y_future = torch.from_numpy(self.y[j:j+h]).float()                        # [h, 2]
+
         return x_start, t_start, dt_seq, x_future, y_future
 
 
 class TestDataset(Dataset):
-    """Test rows for inference: (id, x, t). If no id, use row index 0..N-1."""
+    """Test rows for inference: (gen_id, x, t) — id is generated as row index 0..N-1 (time-sorted)."""
     def __init__(self, df: pd.DataFrame):
-        self.df = df
-        self.ids_col = find_id_column(df)
-        self.ids = df[self.ids_col].values if self.ids_col is not None else np.arange(len(df))
         self.t = df["time"].values.astype(np.float32)
         self.x = df[STATE_COLS].values.astype(np.float32)
+        self.gen_ids = np.arange(len(df), dtype=np.int64)  # ignore any id column
 
     def __len__(self):
-        return len(self.ids)
+        return len(self.gen_ids)
 
     def __getitem__(self, i):
         return (
-            int(self.ids[i]),
+            int(self.gen_ids[i]),
             torch.from_numpy(self.x[i]).float(),  # [D]
             torch.tensor(self.t[i]).float(),      # []
         )
 
 
 # =============================
-# Models
+# Models (architecture copied)
 # =============================
 class DynamicsNet(nn.Module):
     """ f(x,t) -> dx/dt """
@@ -284,6 +283,7 @@ def make_snapshot_path(out_csv: str, epoch: int, val_sum_mse: float) -> str:
 def predict_test_and_write_csv(
     readout: ReadoutNet, test_df: pd.DataFrame, out_csv: str, batch_size: int = 1024
 ):
+    """Predict on test (ignores any id column) and write id,Y1,Y2 where id=0..N-1."""
     readout.to(device).eval()
     td = TestDataset(test_df)
     dl = DataLoader(td, batch_size=batch_size, shuffle=False, drop_last=False)
@@ -306,7 +306,7 @@ def predict_test_and_write_csv(
 
 
 # =============================
-# Training loop
+# Training loop (write CSV on improvement)
 # =============================
 def train_loop(
     model_f: DynamicsNet,
@@ -328,9 +328,8 @@ def train_loop(
       + l_xnext_direct       (X via g)
       + ly_now               (same-time Y)
     Validation metric = **summed** MSE over all Y elements (same-time).
-    On every improvement of validation summed MSE:
-      -> write predictions to out_csv
-      -> also write a snapshot CSV with epoch & val in filename.
+    On every improvement:
+      -> write --out_csv and a snapshot CSV with epoch & val in the filename.
     """
     model_f.to(device)
     model_g.to(device)
@@ -392,7 +391,7 @@ def train_loop(
             pbar_train.set_postfix(train_sum_mse=f"{tr_sum:.6e}")
         pbar_train.close()
 
-        # ---------------- Validation (SAME-TIME Y only) ----------------
+        # ---------------- Validation (SAME-TIME Y only, summed MSE) ----------------
         model_f.eval(); model_g.eval(); readout.eval()
         va_sum = 0.0
 
@@ -427,12 +426,12 @@ def train_loop(
         sched.step(va_sum)
         print(f"Epoch {ep:03d} | val_sum_mse={va_sum:.6e}")
 
-        # If improved, IMMEDIATELY write predictions CSV(s)
+        # If improved, write predictions CSV(s) immediately
         if va_sum + 1e-12 < best_val_sum:
             best_val_sum = va_sum
             patience_ct = 0
 
-            # Write main CSV (overwrites) and a snapshot CSV
+            # Main CSV (overwrite) + snapshot CSV
             predict_test_and_write_csv(readout, test_df, out_csv, batch_size=max(512, batch_size))
             snap_path = make_snapshot_path(out_csv, ep, best_val_sum)
             predict_test_and_write_csv(readout, test_df, snap_path, batch_size=max(512, batch_size))
@@ -448,9 +447,11 @@ def train_loop(
 # Main
 # =============================
 def main():
-    parser = argparse.ArgumentParser(description="Train PINN-like model; write CSV on every val improvement.")
+    parser = argparse.ArgumentParser(
+        description="Train PINN-like model; write CSV on every validation improvement (id ignored)."
+    )
     parser.add_argument("--train_csv", type=str, required=True, help="Path to train.csv (time,A..N,Y1,Y2).")
-    parser.add_argument("--test_csv",  type=str, required=True, help="Path to test.csv (time,A..N,[id]).")
+    parser.add_argument("--test_csv",  type=str, required=True, help="Path to test.csv (time,A..N).")
     parser.add_argument("--out_csv",   type=str, default="predictions.csv", help="Output CSV path (id,Y1,Y2).")
     parser.add_argument("--seed",      type=int, default=42)
     parser.add_argument("--epochs",    type=int, default=300)
@@ -459,7 +460,7 @@ def main():
     parser.add_argument("--lr",        type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--patience",  type=int, default=30)
-    parser.add_argument("--hidden",    type=int, default=128)
+    parser.add_argument("--hidden",    type=int, default=256)
     parser.add_argument("--depth_f",   type=int, default=4)
     parser.add_argument("--depth_g",   type=int, default=3)
     parser.add_argument("--depth_h",   type=int, default=2)
@@ -489,7 +490,7 @@ def main():
     train_idx = np.arange(N)
     train_ds = subset_pairs(full_pairs, train_idx)
 
-    # Models
+    # Models (architecture copied exactly from your working script)
     x_dim = len(STATE_COLS)
     y_dim = len(TARGETS)
     model_f = DynamicsNet(x_dim=x_dim, hidden=args.hidden, depth=args.depth_f)
@@ -511,8 +512,6 @@ def main():
         weight_decay=args.weight_decay,
         patience=args.patience,
     )
-
-    # Note: no final write here; CSVs are already written on each improvement.
 
 
 if __name__ == "__main__":

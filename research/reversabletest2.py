@@ -1,29 +1,41 @@
-import os
-import sys
-from typing import List, Tuple
+# time_flow_trainer.py
+# ------------------------------------------------------------
+# Train NICE-flow + linear head on train.csv (time, A..N, Y1, Y2),
+# include 'time' as an input (concatenated to flow features),
+# validate with SAME-TIME Y summed-MSE over time windows,
+# and EVERY TIME validation improves:
+#   -> predict on test.csv (time, A..N) [id is ignored]
+#   -> write:
+#        - --out_csv (overwrite each improvement)
+#        - snapshot: <stem>.best_epoch{ep}_val{val:.6e}.csv
+#
+# No normalization/standardization. Raw scale end-to-end.
+# ------------------------------------------------------------
 
+import os
+import argparse
+from typing import List
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_absolute_error, mean_squared_error
-import joblib
 
 import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
+import torch.nn.functional as F
+from tqdm import tqdm
 
 
-# ======================================
-# Fixed columns: EXACTLY A..N (14 dims)
-# ======================================
-FEATURES = [chr(c) for c in range(ord("A"), ord("N") + 1)]  # ['A', ..., 'N'] -> 14
-TARGETS  = ["Y1", "Y2"]
+# =============================
+# Columns / device
+# =============================
+FEATURES = ["time"] + [chr(c) for c in range(ord("A"), ord("N") + 1)]  # time + A..N
+STATE_COLS = [c for c in FEATURES if c != "time"]                       # A..N (14)
+TARGETS = ["Y1", "Y2"]
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"[info] Using device: {device}")
 
 
-# -----------------
-# Utilities
-# -----------------
 def set_seed(seed=42):
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -32,33 +44,87 @@ def set_seed(seed=42):
     torch.backends.cudnn.benchmark = False
 
 
-def load_csv(path: str) -> Tuple[np.ndarray, np.ndarray]:
-    if not os.path.exists(path):
-        raise FileNotFoundError(path)
-    df = pd.read_csv(path)
-    missing = [c for c in FEATURES + TARGETS if c not in df.columns]
+# =============================
+# Data loading (NO scaling)
+# =============================
+def require_cols(df: pd.DataFrame, cols: List[str], name: str):
+    missing = [c for c in cols if c not in df.columns]
     if missing:
-        raise ValueError(f"Missing columns: {missing}\nFound: {list(df.columns)}")
-    X = df[FEATURES].apply(pd.to_numeric, errors="coerce")
-    y = df[TARGETS].apply(pd.to_numeric, errors="coerce")
-    mask = ~(X.isna().any(axis=1) | y.isna().any(axis=1))
-    bad = (~mask).sum()
-    if bad:
-        print(f"[info] Dropping {bad} bad rows", file=sys.stderr)
-    return X[mask].values, y[mask].values
+        raise ValueError(f"{name} missing columns: {missing}\nFound: {list(df.columns)}")
+
+def load_train_csv(path: str) -> pd.DataFrame:
+    if not os.path.exists(path): raise FileNotFoundError(path)
+    df = pd.read_csv(path)
+    require_cols(df, FEATURES + TARGETS, "train.csv")
+    for c in FEATURES + TARGETS: df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=FEATURES + TARGETS).sort_values("time").reset_index(drop=True)
+    return df
+
+def load_test_csv(path: str) -> pd.DataFrame:
+    if not os.path.exists(path): raise FileNotFoundError(path)
+    df = pd.read_csv(path)
+    # We IGNORE any id column; only require time + A..N
+    require_cols(df, FEATURES, "test.csv")
+    for c in FEATURES: df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=FEATURES).sort_values("time").reset_index(drop=True)
+    return df
 
 
-class XYDataset(Dataset):
-    def __init__(self, X, y):
-        self.X = torch.from_numpy(X.astype(np.float32))
+# =============================
+# Datasets
+# =============================
+class XYTDataset(Dataset):
+    """Returns (x[A..N], t[scalar], y[2])"""
+    def __init__(self, x: np.ndarray, t: np.ndarray, y: np.ndarray):
+        self.x = torch.from_numpy(x.astype(np.float32))
+        self.t = torch.from_numpy(t.astype(np.float32)).view(-1, 1)
         self.y = torch.from_numpy(y.astype(np.float32))
-    def __len__(self): return self.X.shape[0]
-    def __getitem__(self, i): return self.X[i], self.y[i]
+    def __len__(self): return self.x.shape[0]
+    def __getitem__(self, i): return self.x[i], self.t[i], self.y[i]
+
+class ValDatasetWindowsTime(Dataset):
+    """
+    Windowed validation for SAME-TIME Y:
+      returns (x_future[H,D], t_future[H,1], y_future[H,2]) for each start index
+    """
+    def __init__(self, df: pd.DataFrame, horizon: int = 20):
+        x = df[STATE_COLS].values.astype(np.float32)
+        y = df[TARGETS].values.astype(np.float32)
+        t = df["time"].values.astype(np.float32)
+        self.h = horizon
+        self.x = x; self.y = y; self.t = t
+        max_start = len(t) - (horizon + 1)
+        self.starts = np.arange(max(0, max_start))
+
+    def __len__(self): return len(self.starts)
+
+    def __getitem__(self, k):
+        i = self.starts[k]; j = i + 1; h = self.h
+        x_future = torch.from_numpy(self.x[j:j+h]).float()           # [H, D=14]
+        t_future = torch.from_numpy(self.t[j:j+h]).float().view(h,1) # [H, 1]
+        y_future = torch.from_numpy(self.y[j:j+h]).float()           # [H, 2]
+        return x_future, t_future, y_future
 
 
-# -----------------
-# Simple NICE flow
-# -----------------
+class TestDataset(Dataset):
+    """
+    Test rows for inference: (gen_id, x, t).
+    id is GENERATED as 0..N-1 in time order (we ignore any id column).
+    """
+    def __init__(self, df: pd.DataFrame):
+        self.x = df[STATE_COLS].values.astype(np.float32)
+        self.t = df["time"].values.astype(np.float32)
+        self.gen_ids = np.arange(len(df), dtype=np.int64)
+
+    def __len__(self): return len(self.gen_ids)
+
+    def __getitem__(self, i):
+        return int(self.gen_ids[i]), torch.from_numpy(self.x[i]).float(), torch.tensor(self.t[i], dtype=torch.float32).view(1)
+
+
+# =============================
+# NICE flow + linear head (with time)
+# =============================
 class NICECouplingLayer(nn.Module):
     """
     14 -> 14 additive coupling (split 7/7).
@@ -71,13 +137,10 @@ class NICECouplingLayer(nn.Module):
     def __init__(self, dim: int, hidden_dim: int):
         super().__init__()
         assert dim % 2 == 0, f"Coupling expects even dim, got {dim}"
-        self.dim = dim
         half = dim // 2
         self.net = nn.Sequential(
-            nn.Linear(half, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
+            nn.Linear(half, hidden_dim), nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim), nn.Tanh(),
             nn.Linear(hidden_dim, half),
         )
 
@@ -96,8 +159,8 @@ class NICECouplingLayer(nn.Module):
 
 class NICEFlow(nn.Module):
     """
-    Stack multiple coupling layers with channel swaps to mix dimensions.
-    Keeps shape 14 -> 14 exactly.
+    Stack multiple coupling layers with swaps to mix dims.
+    Shape: 14 -> 14 (A..N only)
     """
     def __init__(self, dim: int, num_layers: int = 4, hidden_dim: int = 128):
         super().__init__()
@@ -121,161 +184,218 @@ class NICEFlow(nn.Module):
         return z
 
 
-# -----------------
-# Model
-# -----------------
 class FlowThenLinearHead(nn.Module):
     """
-    14 -> (NICE flow) -> 14 -> Linear(14->2)
+    x(A..N 14) -> NICEFlow(14) -> z(14)
+    concat time(1) -> [z||t] (15) -> Linear(15->2)
     """
     def __init__(self, in_dim: int = 14, flow_layers: int = 4, flow_hidden: int = 128):
         super().__init__()
         assert in_dim == 14, f"Expected in_dim=14 (A..N), got {in_dim}"
         self.flow = NICEFlow(in_dim, num_layers=flow_layers, hidden_dim=flow_hidden)
-        self.head = nn.Linear(in_dim, 2)  # single layer 14->2 as requested
+        self.head = nn.Linear(in_dim + 1, 2)  # +1 for time
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        z = self.flow(x)       # 14 -> 14
-        y = self.head(z)       # 14 -> 2
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        # x: [B,14], t: [B,1] or [B]
+        if t.dim() == 1: t = t.view(-1, 1)
+        z = self.flow(x)                # [B,14]
+        y = self.head(torch.cat([z, t], dim=1))  # [B,15] -> [B,2]
         return y
 
-    # Optional helpers if you want to peek at/invert the representation
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
+    # Optional helpers (flow operates on x only)
+    def encode(self, x: torch.Tensor) -> torch.Tensor:  # z
         return self.flow(x)
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
+    def decode(self, z: torch.Tensor) -> torch.Tensor:  # x
         return self.flow.inverse(z)
 
 
-# -----------------
-# Training script
-# -----------------
-def main():
-    # ===== Edit these values as needed =====
-    csv_path   = "../research/data/train.csv"   # single CSV; we'll split internally
-    epochs     = 150
-    batch_size = 64
-    lr         = 1e-3
-    weight_decay = 1e-4
-    seed       = 42
-    val_frac   = 0.15
-    test_frac  = 0.15
-    recon_w    = 0.0   # optional: ||x - inverse(encode(x))||^2 (on scaled X)
-    flow_layers = 4
-    flow_hidden = 128
+# =============================
+# CSV writing helpers
+# =============================
+def make_snapshot_path(out_csv: str, epoch: int, val_sum_mse: float) -> str:
+    base, ext = os.path.splitext(out_csv)
+    return f"{base}.best_epoch{epoch}_val{val_sum_mse:.6e}{ext}"
 
-    set_seed(seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[info] Using device: {device}")
+@torch.no_grad()
+def predict_test_and_write_csv(
+    model: FlowThenLinearHead, test_df: pd.DataFrame, out_csv: str, batch_size: int = 1024
+):
+    model.to(device).eval()
+    dl = DataLoader(TestDataset(test_df), batch_size=batch_size, shuffle=False, drop_last=False)
+    ids_all: List[int] = []
+    y1_all: List[float] = []
+    y2_all: List[float] = []
+    for ids, xb, tb in tqdm(dl, desc="Predicting test", unit="batch", leave=False):
+        xb, tb = xb.to(device), tb.to(device)
+        pred = model(xb, tb)  # [B,2]
+        ids_all.extend([int(i) for i in ids])
+        y1_all.extend(pred[:, 0].cpu().numpy().tolist())
+        y2_all.extend(pred[:, 1].cpu().numpy().tolist())
+    out_df = pd.DataFrame({"id": ids_all, "Y1": y1_all, "Y2": y2_all})
+    out_df.to_csv(out_csv, index=False)
+    print(f"[info] Wrote predictions to {out_csv} ({len(out_df)} rows)")
 
-    # Load data (A..N only -> 14 dims)
-    X_all, y_all = load_csv(csv_path)
-    if X_all.shape[1] != 14:
-        raise ValueError(f"Expected exactly 14 features (A..N). Got {X_all.shape[1]}.")
 
-    # Split train/test, then carve out validation from train
-    X_train, X_test, y_train, y_test = train_test_split(
-        X_all, y_all, test_size=test_frac, random_state=seed
-    )
+# =============================
+# Training (summed MSE + write on improvement)
+# =============================
+def train_loop(
+    model: FlowThenLinearHead,
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    out_csv: str,
+    epochs: int = 150,
+    batch_size: int = 64,
+    lr: float = 1e-3,
+    weight_decay: float = 1e-4,
+    patience: int = 25,
+    recon_w: float = 0.0,
+    horizon: int = 20,
+):
+    # Build loaders
+    x_tr = train_df[STATE_COLS].values.astype(np.float32)
+    t_tr = train_df["time"].values.astype(np.float32)
+    y_tr = train_df[TARGETS].values.astype(np.float32)
+    dl_tr = DataLoader(XYTDataset(x_tr, t_tr, y_tr), batch_size=batch_size, shuffle=True, drop_last=False)
 
-    # Scale features with train statistics only
-    scaler = StandardScaler()
-    X_train_s = scaler.fit_transform(X_train)
-    X_test_s  = scaler.transform(X_test)
+    val_windows = ValDatasetWindowsTime(val_df, horizon=horizon)
+    dl_va = DataLoader(val_windows, batch_size=batch_size, shuffle=False, drop_last=False)
 
-    # Build validation split
-    n_train = X_train_s.shape[0]
-    n_val = max(1, int(val_frac * n_train))
-    perm = np.random.permutation(n_train)
-    val_idx, tr_idx = perm[:n_val], perm[n_val:]
-
-    X_tr, y_tr = X_train_s[tr_idx], y_train[tr_idx]
-    X_val, y_val = X_train_s[val_idx], y_train[val_idx]
-
-    # DataLoaders
-    dl_tr  = DataLoader(XYDataset(X_tr, y_tr), batch_size=batch_size, shuffle=True)
-    dl_val = DataLoader(XYDataset(X_val, y_val), batch_size=batch_size, shuffle=False)
-    dl_te  = DataLoader(XYDataset(X_test_s, y_test), batch_size=batch_size, shuffle=False)
-
-    # Model/opt
-    model = FlowThenLinearHead(in_dim=14, flow_layers=flow_layers, flow_hidden=flow_hidden).to(device)
-    opt   = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    model.to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(10, epochs))
-    mse   = nn.MSELoss()
 
-    best_val = float("inf")
-    best_state = None
-    patience, patience_ct = 25, 0
+    best_val_sum = float("inf")
+    patience_ct = 0
 
-    # Train
     for ep in range(1, epochs + 1):
+        # ---------- Train (summed MSE on Y, optional recon) ----------
         model.train()
-        total = 0.0
-        for xb, yb in dl_tr:
-            xb, yb = xb.to(device), yb.to(device)
-            opt.zero_grad()
-            pred = model(xb)
-            loss = mse(pred, yb)
-            if recon_w > 0:
-                with torch.no_grad():
-                    z = model.encode(xb)
-                    xr = model.decode(z)
-                loss = loss + recon_w * ((xr - xb) ** 2).mean()
-            loss.backward()
-            opt.step()
-            total += loss.item() * xb.size(0)
-        tr_loss = total / len(dl_tr.dataset)
+        train_sum = 0.0
 
-        # Validate
+        pbar_tr = tqdm(dl_tr, desc=f"Training [ep {ep}/{epochs}]", unit="batch", leave=False)
+        for xb, tb, yb in pbar_tr:
+            xb, tb, yb = xb.to(device), tb.to(device), yb.to(device)
+            opt.zero_grad()
+
+            pred = model(xb, tb)                   # [B,2]
+            loss_y = F.mse_loss(pred, yb, reduction="sum")
+
+            # Optional invertibility reconstruction on X via flow
+            if recon_w > 0:
+                z = model.encode(xb)
+                xr = model.decode(z)
+                loss_recon = F.mse_loss(xr, xb, reduction="sum")
+                loss = loss_y + recon_w * loss_recon
+            else:
+                loss = loss_y
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+
+            train_sum += loss.item()
+            pbar_tr.set_postfix(train_sum_mse=f"{train_sum:.6e}")
+        pbar_tr.close()
+
+        # ---------- Validation (SAME-TIME Y, windowed, SUMMED MSE) ----------
         model.eval()
-        vloss = 0.0
+        val_sum = 0.0
+        pbar_va = tqdm(dl_va, desc="Validating", unit="batch", leave=False)
         with torch.no_grad():
-            for xb, yb in dl_val:
-                xb, yb = xb.to(device), yb.to(device)
-                out = model(xb)
-                l = mse(out, yb)
-                if recon_w > 0:
-                    z = model.encode(xb)
-                    xr = model.decode(z)
-                    l = l + recon_w * ((xr - xb) ** 2).mean()
-                vloss += l.item() * xb.size(0)
-        vloss /= len(dl_val.dataset)
+            for x_future, t_future, y_future in pbar_va:
+                # x_future: [B, H, 14], t_future: [B, H, 1], y_future: [B, H, 2]
+                B, H, D = x_future.shape
+                x_future = x_future.to(device)
+                t_future = t_future.to(device)
+                y_gt     = y_future.to(device)
+
+                # Predict per step using (x_h, t_h)
+                y_preds = []
+                for h in range(H):
+                    y_hat_h = model(x_future[:, h, :], t_future[:, h, :])  # [B,2]
+                    y_preds.append(y_hat_h.unsqueeze(1))
+                y_pred = torch.cat(y_preds, dim=1)       # [B,H,2]
+
+                batch_sum = F.mse_loss(y_pred, y_gt, reduction="sum")
+                val_sum += batch_sum.item()
+                pbar_va.set_postfix(val_sum_mse=f"{val_sum:.6e}")
+        pbar_va.close()
         sched.step()
 
-        print(f"Epoch {ep:03d} | train={tr_loss:.5f} | val={vloss:.5f}")
+        print(f"Epoch {ep:03d} | val_sum_mse={val_sum:.6e}")
 
-        if vloss < best_val - 1e-8:
-            best_val = vloss
-            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+        # ---------- Write CSV on improvement ----------
+        if val_sum + 1e-12 < best_val_sum:
+            best_val_sum = val_sum
             patience_ct = 0
+            # main csv
+            predict_test_and_write_csv(model, test_df, out_csv, batch_size=max(512, batch_size))
+            # snapshot csv
+            snap_path = make_snapshot_path(out_csv, ep, best_val_sum)
+            #predict_test_and_write_csv(model, test_df, snap_path, batch_size=max(512, batch_size))
+            print(f"[info] New best at epoch {ep}: val_sum_mse={best_val_sum:.6e}")
         else:
             patience_ct += 1
             if patience_ct >= patience:
-                print(f"[info] Early stopping at epoch {ep}. Best val={best_val:.6f}")
+                print(f"[info] Early stopping at epoch {ep}. Best val_sum_mse={best_val_sum:.6e}")
                 break
 
-    if best_state:
-        model.load_state_dict(best_state)
 
-    # Test
-    model.eval()
-    preds, gts = [], []
-    with torch.no_grad():
-        for xb, yb in dl_te:
-            xb = xb.to(device)
-            preds.append(model(xb).cpu().numpy())
-            gts.append(yb.numpy())
-    preds, gts = np.vstack(preds), np.vstack(gts)
-    mae = mean_absolute_error(gts, preds, multioutput="raw_values")
-    mse_vals = mean_squared_error(gts, preds, multioutput="raw_values")
-    print("\n=== Test Metrics ===")
-    for i, t in enumerate(TARGETS):
-        print(f"{t}: MAE={mae[i]:.5f}, MSE={mse_vals[i]:.5f}, RMSE={np.sqrt(mse_vals[i]):.5f}")
+# =============================
+# Main
+# =============================
+def main():
+    parser = argparse.ArgumentParser(
+        description="Train NICE-flow + linear head (with time); write CSV on each val improvement (id ignored)."
+    )
+    parser.add_argument("--train_csv", type=str, required=True, help="Path to train.csv (time,A..N,Y1,Y2).")
+    parser.add_argument("--test_csv",  type=str, required=True, help="Path to test.csv (time,A..N).")
+    parser.add_argument("--out_csv",   type=str, default="predictions.csv", help="Output CSV path (id,Y1,Y2).")
+    parser.add_argument("--seed",      type=int, default=42)
+    parser.add_argument("--epochs",    type=int, default=150)
+    parser.add_argument("--batch_size",type=int, default=64)
+    parser.add_argument("--lr",        type=float, default=1e-3)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--patience",  type=int, default=25)
+    parser.add_argument("--horizon",   type=int, default=20, help="Validation window length.")
+    parser.add_argument("--recon_w",   type=float, default=0.0, help="Optional X reconstruction weight via flow.")
+    parser.add_argument("--flow_layers", type=int, default=4)
+    parser.add_argument("--flow_hidden", type=int, default=128)
+    parser.add_argument("--val_frac",  type=float, default=0.15, help="Fraction of train used as validation tail.")
+    args = parser.parse_args()
 
-    # Save
-    os.makedirs("artifacts", exist_ok=True)
-    torch.save(model.state_dict(), "artifacts/model_14to14_then2.pt")
-    joblib.dump(scaler, "artifacts/scaler.joblib")
-    print("Saved model & scaler to ./artifacts")
+    set_seed(args.seed)
+
+    # Load data
+    train_df = load_train_csv(args.train_csv)
+    test_df  = load_test_csv(args.test_csv)
+
+    # Time-based split for validation: use tail fraction as val to prevent leakage
+    n = len(train_df)
+    n_val = max(1, int(args.val_frac * n))
+    tr_df = train_df.iloc[: n - n_val].copy()
+    va_df = train_df.iloc[n - n_val :].copy()
+
+    # Model
+    model = FlowThenLinearHead(in_dim=14, flow_layers=args.flow_layers, flow_hidden=args.flow_hidden)
+
+    print("[info] Training start")
+    train_loop(
+        model=model,
+        train_df=tr_df,
+        val_df=va_df,
+        test_df=test_df,
+        out_csv=args.out_csv,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        patience=args.patience,
+        recon_w=args.recon_w,
+        horizon=args.horizon,
+    )
 
 
 if __name__ == "__main__":
