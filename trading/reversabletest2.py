@@ -1,6 +1,7 @@
 # time_flow_trainer.py
 # ------------------------------------------------------------
 # Train NICE-flow + linear head on train.csv (time, A..N, Y1, Y2),
+# include 'time' as an input (concatenated to flow features),
 # validate with SAME-TIME Y summed-MSE over time windows,
 # and EVERY TIME validation improves:
 #   -> predict on test.csv (time, A..N) [id is ignored]
@@ -72,17 +73,19 @@ def load_test_csv(path: str) -> pd.DataFrame:
 # =============================
 # Datasets
 # =============================
-class XYDataset(Dataset):
-    def __init__(self, x: np.ndarray, y: np.ndarray):
+class XYTDataset(Dataset):
+    """Returns (x[A..N], t[scalar], y[2])"""
+    def __init__(self, x: np.ndarray, t: np.ndarray, y: np.ndarray):
         self.x = torch.from_numpy(x.astype(np.float32))
+        self.t = torch.from_numpy(t.astype(np.float32)).view(-1, 1)
         self.y = torch.from_numpy(y.astype(np.float32))
     def __len__(self): return self.x.shape[0]
-    def __getitem__(self, i): return self.x[i], self.y[i]
+    def __getitem__(self, i): return self.x[i], self.t[i], self.y[i]
 
-class ValDatasetWindows(Dataset):
+class ValDatasetWindowsTime(Dataset):
     """
     Windowed validation for SAME-TIME Y:
-      returns (x_future[H,D], y_future[H,2]) for each start index
+      returns (x_future[H,D], t_future[H,1], y_future[H,2]) for each start index
     """
     def __init__(self, df: pd.DataFrame, horizon: int = 20):
         x = df[STATE_COLS].values.astype(np.float32)
@@ -96,31 +99,31 @@ class ValDatasetWindows(Dataset):
     def __len__(self): return len(self.starts)
 
     def __getitem__(self, k):
-        i = self.starts[k]
-        j = i + 1
-        h = self.h
-        x_future = torch.from_numpy(self.x[j:j+h]).float()   # [H, D]
-        y_future = torch.from_numpy(self.y[j:j+h]).float()   # [H, 2]
-        return x_future, y_future
+        i = self.starts[k]; j = i + 1; h = self.h
+        x_future = torch.from_numpy(self.x[j:j+h]).float()           # [H, D=14]
+        t_future = torch.from_numpy(self.t[j:j+h]).float().view(h,1) # [H, 1]
+        y_future = torch.from_numpy(self.y[j:j+h]).float()           # [H, 2]
+        return x_future, t_future, y_future
 
 
 class TestDataset(Dataset):
     """
-    Test rows for inference: (gen_id, x).
+    Test rows for inference: (gen_id, x, t).
     id is GENERATED as 0..N-1 in time order (we ignore any id column).
     """
     def __init__(self, df: pd.DataFrame):
         self.x = df[STATE_COLS].values.astype(np.float32)
+        self.t = df["time"].values.astype(np.float32)
         self.gen_ids = np.arange(len(df), dtype=np.int64)
 
     def __len__(self): return len(self.gen_ids)
 
     def __getitem__(self, i):
-        return int(self.gen_ids[i]), torch.from_numpy(self.x[i]).float()
+        return int(self.gen_ids[i]), torch.from_numpy(self.x[i]).float(), torch.tensor(self.t[i], dtype=torch.float32).view(1)
 
 
 # =============================
-# NICE flow + linear head (copied arch)
+# NICE flow + linear head (with time)
 # =============================
 class NICECouplingLayer(nn.Module):
     """
@@ -157,7 +160,7 @@ class NICECouplingLayer(nn.Module):
 class NICEFlow(nn.Module):
     """
     Stack multiple coupling layers with swaps to mix dims.
-    Shape: 14 -> 14
+    Shape: 14 -> 14 (A..N only)
     """
     def __init__(self, dim: int, num_layers: int = 4, hidden_dim: int = 128):
         super().__init__()
@@ -183,23 +186,26 @@ class NICEFlow(nn.Module):
 
 class FlowThenLinearHead(nn.Module):
     """
-    14 -> NICEFlow -> 14 -> Linear(14->2)
+    x(A..N 14) -> NICEFlow(14) -> z(14)
+    concat time(1) -> [z||t] (15) -> Linear(15->2)
     """
     def __init__(self, in_dim: int = 14, flow_layers: int = 4, flow_hidden: int = 128):
         super().__init__()
         assert in_dim == 14, f"Expected in_dim=14 (A..N), got {in_dim}"
         self.flow = NICEFlow(in_dim, num_layers=flow_layers, hidden_dim=flow_hidden)
-        self.head = nn.Linear(in_dim, 2)
+        self.head = nn.Linear(in_dim + 1, 2)  # +1 for time
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        z = self.flow(x)
-        y = self.head(z)
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        # x: [B,14], t: [B,1] or [B]
+        if t.dim() == 1: t = t.view(-1, 1)
+        z = self.flow(x)                # [B,14]
+        y = self.head(torch.cat([z, t], dim=1))  # [B,15] -> [B,2]
         return y
 
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
+    # Optional helpers (flow operates on x only)
+    def encode(self, x: torch.Tensor) -> torch.Tensor:  # z
         return self.flow(x)
-
-    def decode(self, z: torch.Tensor) -> torch.Tensor:
+    def decode(self, z: torch.Tensor) -> torch.Tensor:  # x
         return self.flow.inverse(z)
 
 
@@ -219,9 +225,9 @@ def predict_test_and_write_csv(
     ids_all: List[int] = []
     y1_all: List[float] = []
     y2_all: List[float] = []
-    for ids, xb in tqdm(dl, desc="Predicting test", unit="batch", leave=False):
-        xb = xb.to(device)
-        pred = model(xb)  # [B,2]
+    for ids, xb, tb in tqdm(dl, desc="Predicting test", unit="batch", leave=False):
+        xb, tb = xb.to(device), tb.to(device)
+        pred = model(xb, tb)  # [B,2]
         ids_all.extend([int(i) for i in ids])
         y1_all.extend(pred[:, 0].cpu().numpy().tolist())
         y2_all.extend(pred[:, 1].cpu().numpy().tolist())
@@ -245,16 +251,15 @@ def train_loop(
     weight_decay: float = 1e-4,
     patience: int = 25,
     recon_w: float = 0.0,
-    flow_layers: int = 4,
-    flow_hidden: int = 128,
     horizon: int = 20,
 ):
     # Build loaders
     x_tr = train_df[STATE_COLS].values.astype(np.float32)
+    t_tr = train_df["time"].values.astype(np.float32)
     y_tr = train_df[TARGETS].values.astype(np.float32)
-    dl_tr = DataLoader(XYDataset(x_tr, y_tr), batch_size=batch_size, shuffle=True, drop_last=False)
+    dl_tr = DataLoader(XYTDataset(x_tr, t_tr, y_tr), batch_size=batch_size, shuffle=True, drop_last=False)
 
-    val_windows = ValDatasetWindows(val_df, horizon=horizon)
+    val_windows = ValDatasetWindowsTime(val_df, horizon=horizon)
     dl_va = DataLoader(val_windows, batch_size=batch_size, shuffle=False, drop_last=False)
 
     model.to(device)
@@ -270,11 +275,11 @@ def train_loop(
         train_sum = 0.0
 
         pbar_tr = tqdm(dl_tr, desc=f"Training [ep {ep}/{epochs}]", unit="batch", leave=False)
-        for xb, yb in pbar_tr:
-            xb, yb = xb.to(device), yb.to(device)
+        for xb, tb, yb in pbar_tr:
+            xb, tb, yb = xb.to(device), tb.to(device), yb.to(device)
             opt.zero_grad()
 
-            pred = model(xb)                     # [B,2]
+            pred = model(xb, tb)                   # [B,2]
             loss_y = F.mse_loss(pred, yb, reduction="sum")
 
             # Optional invertibility reconstruction on X via flow
@@ -299,16 +304,17 @@ def train_loop(
         val_sum = 0.0
         pbar_va = tqdm(dl_va, desc="Validating", unit="batch", leave=False)
         with torch.no_grad():
-            for x_future, y_future in pbar_va:
-                # x_future: [B, H, D], y_future: [B, H, 2]
+            for x_future, t_future, y_future in pbar_va:
+                # x_future: [B, H, 14], t_future: [B, H, 1], y_future: [B, H, 2]
                 B, H, D = x_future.shape
                 x_future = x_future.to(device)
-                y_gt = y_future.to(device)
+                t_future = t_future.to(device)
+                y_gt     = y_future.to(device)
 
-                # Predict per step (no time used in this model)
+                # Predict per step using (x_h, t_h)
                 y_preds = []
                 for h in range(H):
-                    y_hat_h = model(x_future[:, h, :])  # [B,2]
+                    y_hat_h = model(x_future[:, h, :], t_future[:, h, :])  # [B,2]
                     y_preds.append(y_hat_h.unsqueeze(1))
                 y_pred = torch.cat(y_preds, dim=1)       # [B,H,2]
 
@@ -342,7 +348,7 @@ def train_loop(
 # =============================
 def main():
     parser = argparse.ArgumentParser(
-        description="Train NICE-flow + linear head; write CSV on each val improvement (id ignored)."
+        description="Train NICE-flow + linear head (with time); write CSV on each val improvement (id ignored)."
     )
     parser.add_argument("--train_csv", type=str, required=True, help="Path to train.csv (time,A..N,Y1,Y2).")
     parser.add_argument("--test_csv",  type=str, required=True, help="Path to test.csv (time,A..N).")
@@ -366,7 +372,7 @@ def main():
     train_df = load_train_csv(args.train_csv)
     test_df  = load_test_csv(args.test_csv)
 
-    # Build a time-based split for validation: use tail fraction as val to prevent leakage
+    # Time-based split for validation: use tail fraction as val to prevent leakage
     n = len(train_df)
     n_val = max(1, int(args.val_frac * n))
     tr_df = train_df.iloc[: n - n_val].copy()
@@ -388,8 +394,6 @@ def main():
         weight_decay=args.weight_decay,
         patience=args.patience,
         recon_w=args.recon_w,
-        flow_layers=args.flow_layers,
-        flow_hidden=args.flow_hidden,
         horizon=args.horizon,
     )
 
