@@ -1,30 +1,26 @@
 # time_pinn_trainer.py
 # ------------------------------------------------------------
-# Purpose
-#   Learn:
-#     - f(x,t): continuous-time dynamics via RK4 (forward/back/cycle)
-#     - g(x,t,dt): direct next-step predictor for X_{t+1}
-#     - h(x,t): readout for Y=(Y1,Y2) at SAME time step
+# Train on train.csv, validate on held-out windows within train.csv,
+# then run the best (in-memory) model on test.csv and write predictions
+# to a CSV with columns: id, Y1, Y2.
 #
-# Data
+# Requirements:
 #   train.csv: columns time, A..N, Y1, Y2
-#   test.csv : columns id, time, A..N
-#   We normalize X (A..N) and Y (Y1,Y2) using TRAIN statistics.
+#   test.csv : columns time, A..N (+ optional id)
 #
-# Validation metric
-#   ONLY same-time mapping: y_hat = h(x_true, t_true) vs y_true
-#   **SUM** of MSE over the whole validation set (not mean).
-#
-# On improvement
-#   Instead of saving weights, we write predictions from test.csv to:
-#     ./artifacts/predictions.csv
-#   (Y is de-normalized), and print exactly:
-#     saved
+# Key design:
+#   - No normalization/standardization (raw scale).
+#   - Loss = SUM of MSEs for:
+#       * RK4 forward/back/cycle on X via f(x,t)
+#       * Direct next-step X via g(x,t,dt)
+#       * Same-time Y via h(x,t)
+#   - Validation metric: same-time Y MSE (direct h(x,t)), averaged per element.
+#   - After training, run inference on test.csv and save id,Y1,Y2
 # ------------------------------------------------------------
 
 import os
 import argparse
-from typing import Tuple, Optional, List
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -36,12 +32,13 @@ from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
 
+
 # =============================
 # Columns & device
 # =============================
 FEATURES = ["time"] + [chr(c) for c in range(ord("A"), ord("N") + 1)]  # time + A..N (15 total)
 STATE_COLS = [c for c in FEATURES if c != "time"]                       # A..N (14 dims)
-TARGETS = ["Y1", "Y2"]                                                  # supervision targets
+TARGETS = ["Y1", "Y2"]
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"[info] Using device: {device}")
@@ -54,19 +51,20 @@ def set_seed(seed: int = 42):
 
 
 # =============================
-# Data loading utilities
+# Data loading (no scaling)
 # =============================
+def require_cols(df: pd.DataFrame, cols: List[str], name: str):
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"{name} missing required columns: {missing}\nFound: {list(df.columns)}")
+
+
 def load_train_csv(path: str) -> pd.DataFrame:
     if not os.path.exists(path):
         raise FileNotFoundError(path)
     df = pd.read_csv(path)
+    require_cols(df, FEATURES + TARGETS, "train.csv")
 
-    # Ensure required columns exist
-    missing = [c for c in FEATURES + TARGETS if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing required columns in train CSV: {missing}\nFound: {list(df.columns)}")
-
-    # Coerce numeric and drop rows with NaNs in required fields
     for c in FEATURES + TARGETS:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.dropna(subset=FEATURES + TARGETS).sort_values("time").reset_index(drop=True)
@@ -77,73 +75,46 @@ def load_test_csv(path: str) -> pd.DataFrame:
     if not os.path.exists(path):
         raise FileNotFoundError(path)
     df = pd.read_csv(path)
-
-    required = ["id", "time"] + STATE_COLS
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing required columns in test CSV: {missing}\nFound: {list(df.columns)}")
-
-    # Do NOT coerce id (could be string). Coerce numeric features.
-    df["time"] = pd.to_numeric(df["time"], errors="coerce")
-    for c in STATE_COLS:
+    require_cols(df, FEATURES, "test.csv")  # Y not required
+    for c in FEATURES:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.dropna(subset=["time"] + STATE_COLS).sort_values("time").reset_index(drop=True)
+    df = df.dropna(subset=FEATURES).sort_values("time").reset_index(drop=True)
     return df
 
 
+def find_id_column(df: pd.DataFrame) -> Optional[str]:
+    # Prefer exact 'id', else case-insensitive match.
+    if "id" in df.columns:
+        return "id"
+    for c in df.columns:
+        if c.lower() == "id":
+            return c
+    return None
+
+
 # =============================
-# Training dataset (pairwise)
+# Datasets (no scaling)
 # =============================
 class PairDataset(Dataset):
     """
-    Returns (x_t, t_t, x_{t+1}, t_{t+1}, dt, y_t, y_{t+1}),
-    with X and Y standardized using stats from x_t and y_t unless provided.
+    Training pairs: (x_t, t_t, x_{t+1}, t_{t+1}, dt, y_t, y_{t+1})
     """
-    def __init__(
-        self,
-        df: pd.DataFrame,
-        scaler_state: Optional[Tuple[np.ndarray, np.ndarray]] = None,
-        scaler_target: Optional[Tuple[np.ndarray, np.ndarray]] = None,
-    ):
+    def __init__(self, df: pd.DataFrame):
         t = df["time"].values.astype(np.float32)
         x = df[STATE_COLS].values.astype(np.float32)
         y = df[TARGETS].values.astype(np.float32)
 
         dt = np.diff(t)
         valid = dt > 0
-        idx = np.where(valid)[0]  # pairs i -> i+1
+        idx = np.where(valid)[0]  # i -> i+1
 
         self.t0 = t[idx]
         self.t1 = t[idx + 1]
         self.dt = dt[idx]
-        self.x0_raw = x[idx]
-        self.x1_raw = x[idx + 1]
-        self.y0_raw = y[idx]
-        self.y1_raw = y[idx + 1]
-
-        # X scaler
-        if scaler_state is None:
-            x_mean = self.x0_raw.mean(axis=0, keepdims=True)
-            x_std  = self.x0_raw.std(axis=0, keepdims=True) + 1e-8
-        else:
-            x_mean, x_std = scaler_state
-
-        # Y scaler
-        if scaler_target is None:
-            y_mean = self.y0_raw.mean(axis=0, keepdims=True)
-            y_std  = self.y0_raw.std(axis=0, keepdims=True) + 1e-8
-        else:
-            y_mean, y_std = scaler_target
-
-        self.x_mean = x_mean.astype(np.float32)
-        self.x_std  = x_std.astype(np.float32)
-        self.y_mean = y_mean.astype(np.float32)
-        self.y_std  = y_std.astype(np.float32)
-
-        self.x0 = (self.x0_raw - self.x_mean) / self.x_std
-        self.x1 = (self.x1_raw - self.x_mean) / self.x_std
-        self.y0 = (self.y0_raw - self.y_mean) / self.y_std
-        self.y1 = (self.y1_raw - self.y_mean) / self.y_std
+        self.x0 = x[idx]
+        self.x1 = x[idx + 1]
+        self.y0 = y[idx]
+        self.y1 = y[idx + 1]
 
     def __len__(self):
         return self.x0.shape[0]
@@ -151,44 +122,28 @@ class PairDataset(Dataset):
     def __getitem__(self, i):
         return (
             torch.from_numpy(self.x0[i]),            # [D]
-            torch.tensor(self.t0[i]),                # scalar
+            torch.tensor(self.t0[i]),                # []
             torch.from_numpy(self.x1[i]),            # [D]
-            torch.tensor(self.t1[i]),                # scalar
-            torch.tensor(self.dt[i]),                # scalar
+            torch.tensor(self.t1[i]),                # []
+            torch.tensor(self.dt[i]),                # []
             torch.from_numpy(self.y0[i]),            # [2]
             torch.from_numpy(self.y1[i]),            # [2]
         )
 
 
-# =============================
-# Validation dataset (same-time Y only, windowed)
-# =============================
 class ValDatasetSameTimeY(Dataset):
     """
-    For validation: same-time mapping (x,t) -> y across a window.
-    Returns: x_start, t_start, dt_seq [H], x_future [H,D], y_future [H,2]
+    Validation windows for same-time Y: (x_start, t_start, dt_seq[H], x_future[H,D], y_future[H,2])
     """
-    def __init__(
-        self,
-        df: pd.DataFrame,
-        mean_x: np.ndarray,
-        std_x: np.ndarray,
-        mean_y: np.ndarray,
-        std_y: np.ndarray,
-        horizon: int = 20
-    ):
+    def __init__(self, df: pd.DataFrame, horizon: int = 20):
         t = df["time"].values.astype(np.float32)
         x = df[STATE_COLS].values.astype(np.float32)
         y = df[TARGETS].values.astype(np.float32)
 
         self.horizon = horizon
         self.t = t
-        self.x = (x - mean_x) / std_x
-        self.y = (y - mean_y) / std_y
-        self.x_mean = mean_x.astype(np.float32)
-        self.x_std  = std_x.astype(np.float32)
-        self.y_mean = mean_y.astype(np.float32)
-        self.y_std  = std_y.astype(np.float32)
+        self.x = x
+        self.y = y
 
         max_start = len(t) - (horizon + 1)
         self.starts = np.arange(max(0, max_start))
@@ -202,13 +157,36 @@ class ValDatasetSameTimeY(Dataset):
         h = self.horizon
 
         x_start = torch.from_numpy(self.x[i]).float()     # [D]
-        t_start = torch.tensor(self.t[i]).float()         # scalar
+        t_start = torch.tensor(self.t[i]).float()         # []
 
         dt_seq   = torch.from_numpy(np.diff(self.t[i:i+h+1]).astype(np.float32))  # [h]
         x_future = torch.from_numpy(self.x[j:j+h]).float()                        # [h, D]
         y_future = torch.from_numpy(self.y[j:j+h]).float()                        # [h, 2]
 
         return x_start, t_start, dt_seq, x_future, y_future
+
+
+class TestDataset(Dataset):
+    """
+    Test rows for inference: (id, x, t)
+    If no id column, id = row index [0..N-1].
+    """
+    def __init__(self, df: pd.DataFrame):
+        self.df = df
+        self.ids_col = find_id_column(df)
+        self.ids = df[self.ids_col].values if self.ids_col is not None else np.arange(len(df))
+        self.t = df["time"].values.astype(np.float32)
+        self.x = df[STATE_COLS].values.astype(np.float32)
+
+    def __len__(self):
+        return len(self.ids)
+
+    def __getitem__(self, i):
+        return (
+            int(self.ids[i]),
+            torch.from_numpy(self.x[i]).float(),  # [D]
+            torch.tensor(self.t[i]).float(),      # []
+        )
 
 
 # =============================
@@ -227,16 +205,14 @@ class DynamicsNet(nn.Module):
         self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        if t.dim() == 0:
-            t = t.expand(x.size(0))
-        elif t.dim() > 1:
-            t = t.view(t.size(0), -1).squeeze(1)
+        if t.dim() == 0: t = t.expand(x.size(0))
+        elif t.dim() > 1: t = t.view(t.size(0), -1).squeeze(1)
         t = t.view(-1, 1)
         return self.net(torch.cat([x, t], dim=1))
 
 
 class NextStepNet(nn.Module):
-    """ g(x,t,dt) -> x_next (direct one-step transition) """
+    """ g(x,t,dt) -> x_next """
     def __init__(self, x_dim: int, hidden: int = 128, depth: int = 3):
         super().__init__()
         layers: List[nn.Module] = []
@@ -261,7 +237,7 @@ class NextStepNet(nn.Module):
 
 
 class ReadoutNet(nn.Module):
-    """ h(x,t) -> y_hat (Y1, Y2) """
+    """ h(x,t) -> (Y1, Y2) """
     def __init__(self, x_dim: int, y_dim: int = 2, hidden: int = 128, depth: int = 2):
         super().__init__()
         layers: List[nn.Module] = []
@@ -273,10 +249,8 @@ class ReadoutNet(nn.Module):
         self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        if t.dim() == 0:
-            t = t.expand(x.size(0))
-        elif t.dim() > 1:
-            t = t.view(t.size(0), -1).squeeze(1)
+        if t.dim() == 0: t = t.expand(x.size(0))
+        elif t.dim() > 1: t = t.view(t.size(0), -1).squeeze(1)
         t = t.view(-1, 1)
         return self.net(torch.cat([x, t], dim=1))
 
@@ -311,46 +285,6 @@ def rk4_step(x: torch.Tensor, t: torch.Tensor, dt: torch.Tensor, f: DynamicsNet)
 
 
 # =============================
-# Prediction writer (on best val)
-# =============================
-def write_predictions_csv_from_df(
-    readout: "ReadoutNet",
-    df_test: pd.DataFrame,
-    x_mean: np.ndarray,
-    x_std: np.ndarray,
-    y_mean: np.ndarray,
-    y_std: np.ndarray,
-    out_path: str,
-):
-    required = ["id", "time"] + STATE_COLS
-    missing = [c for c in required if c not in df_test.columns]
-    if missing:
-        raise ValueError(f"Missing columns in test CSV: {missing}")
-
-    # normalize inputs with TRAIN scalers
-    x_raw = df_test[STATE_COLS].values.astype(np.float32)
-    t     = df_test["time"].values.astype(np.float32)
-    x_n   = (x_raw - x_mean.astype(np.float32)) / (x_std.astype(np.float32) + 1e-8)
-
-    x_t   = torch.from_numpy(x_n).to(device)
-    t_t   = torch.from_numpy(t).to(device)
-
-    readout.eval()
-    with torch.no_grad():
-        y_hat_n = readout(x_t, t_t)  # normalized Y
-        y_hat   = y_hat_n.cpu().numpy() * y_std.astype(np.float32) + y_mean.astype(np.float32)
-
-    out = pd.DataFrame({
-        "id": df_test["id"].values,
-        "Y1": y_hat[:, 0],
-        "Y2": y_hat[:, 1],
-    })
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    out.to_csv(out_path, index=False)
-    print("saved")  # exactly as requested
-
-
-# =============================
 # Training loop
 # =============================
 def train_loop(
@@ -359,36 +293,18 @@ def train_loop(
     readout: ReadoutNet,
     train_ds: PairDataset,
     val_ds: ValDatasetSameTimeY,
-    df_test: pd.DataFrame,
-    pred_out_path: str,
-    x_mean: np.ndarray,
-    x_std: np.ndarray,
-    y_mean: np.ndarray,
-    y_std: np.ndarray,
     epochs: int = 300,
     batch_size: int = 128,
     lr: float = 1e-3,
     weight_decay: float = 1e-4,
-    # reconstruction weights (via RK4/f)
-    w_forward: float = 1.0,
-    w_backward: float = 1.0,
-    w_cycle: float = 0.5,
-    # direct next-step X (via g)
-    w_xnext_direct: float = 1.0,
-    # Y supervision (same-time required; next-time optional anchors)
-    w_y_now: float = 1.0,
-    w_y_next_via_rk4: float = 0.25,
-    w_y_next_via_g: float = 0.25,
     patience: int = 30,
 ):
     """
-    Train with:
-      - RK4 reconstruction on X via f
-      - Direct next-step X via g
-      - SAME-TIME Y via h (required)
-      - OPTIONAL next-time Y anchors via RK4 and/or g
-    Validate ONLY by SAME-TIME Y from ground-truth X,t, using SUM of MSE.
-    On validation improvement, write predictions CSV from test.csv and print "saved".
+    Loss per batch = SUM of MSEs:
+      l_fwd  + l_bwd + l_cyc     (X via RK4)
+      + l_xnext_direct           (X via g)
+      + ly_now                   (same-time Y)
+    Validation metric = mean MSE over Y predictions at same time (h(x,t)).
     """
     model_f.to(device)
     model_g.to(device)
@@ -403,13 +319,15 @@ def train_loop(
     dl_tr = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
     dl_va = DataLoader(val_ds,  batch_size=batch_size, shuffle=False, drop_last=False)
 
-    best_val_sum = float("inf")
+    best_val = float("inf")
+    best_state = None
     patience_ct = 0
 
     for ep in range(1, epochs + 1):
         # ---------------- Train ----------------
         model_f.train(); model_g.train(); readout.train()
-        tr_sum, n_tr = 0.0, 0
+        tr_loss_sum = 0.0
+        tr_count = 0
 
         pbar_train = tqdm(dl_tr, desc=f"Training [ep {ep}/{epochs}]", unit="batch", leave=False)
         for x0, t0, x1, t1, dt, y0, y1 in pbar_train:
@@ -419,42 +337,26 @@ def train_loop(
             opt.zero_grad()
 
             # RK4 reconstruction via f
-            x1_hat_rk4 = rk4_step(x0, t0, dt, model_f)        # predict next
-            x0_hat_rk4 = rk4_step(x1, t1, -dt, model_f)       # reconstruct prev
+            x1_hat_rk4 = rk4_step(x0, t0, dt, model_f)
+            x0_hat_rk4 = rk4_step(x1, t1, -dt, model_f)
             with torch.no_grad():
                 x1_hat_det = x1_hat_rk4.detach()
             x0_cyc_rk4 = rk4_step(x1_hat_det, t1, -dt, model_f)
 
-            l_fwd = F.mse_loss(x1_hat_rk4, x1)
-            l_bwd = F.mse_loss(x0_hat_rk4, x0)
-            l_cyc = F.mse_loss(x0_cyc_rk4, x0)
+            # SUM MSE components (reduction='sum')
+            l_fwd = F.mse_loss(x1_hat_rk4, x1, reduction="sum")
+            l_bwd = F.mse_loss(x0_hat_rk4, x0, reduction="sum")
+            l_cyc = F.mse_loss(x0_cyc_rk4, x0, reduction="sum")
 
             # Direct next-step via g
             x1_hat_g = model_g(x0, t0, dt)
-            l_xnext_direct = F.mse_loss(x1_hat_g, x1)
+            l_xnext_direct = F.mse_loss(x1_hat_g, x1, reduction="sum")
 
-            # Y supervision (same-time required)
+            # SAME-TIME Y via h
             y0_hat = readout(x0, t0)
-            ly_now = F.mse_loss(y0_hat, y0)
+            ly_now = F.mse_loss(y0_hat, y0, reduction="sum")
 
-            # Optional anchors at next time
-            ly_next_rk4 = torch.tensor(0.0, device=device)
-            if w_y_next_via_rk4 > 0:
-                y1_hat_rk4 = readout(x1_hat_rk4, t1)
-                ly_next_rk4 = F.mse_loss(y1_hat_rk4, y1)
-
-            ly_next_g = torch.tensor(0.0, device=device)
-            if w_y_next_via_g > 0:
-                y1_hat_g = readout(x1_hat_g, t1)
-                ly_next_g = F.mse_loss(y1_hat_g, y1)
-
-            loss = (
-                w_forward * l_fwd + w_backward * l_bwd + w_cycle * l_cyc
-                + w_xnext_direct * l_xnext_direct
-                + w_y_now * ly_now
-                + w_y_next_via_rk4 * ly_next_rk4
-                + w_y_next_via_g * ly_next_g
-            )
+            loss = l_fwd + l_bwd + l_cyc + l_xnext_direct + ly_now
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
                 list(model_f.parameters()) + list(model_g.parameters()) + list(readout.parameters()),
@@ -462,169 +364,176 @@ def train_loop(
             )
             opt.step()
 
-            bs = x0.size(0)
-            tr_sum += loss.item() * bs
-            n_tr += bs
-            pbar_train.set_postfix(mean_loss=f"{tr_sum / max(1, n_tr):.4f}")
+            tr_loss_sum += loss.item()
+            tr_count += 1
+            pbar_train.set_postfix(loss_sum=f"{tr_loss_sum / max(1,tr_count):.6e}")
         pbar_train.close()
-        tr_loss_mean = tr_sum / max(1, n_tr)
 
-        # ---------------- Validation (SAME-TIME Y only, SUM) ----------------
+        # ---------------- Validation (SAME-TIME Y only) ----------------
         model_f.eval(); model_g.eval(); readout.eval()
-        va_sum = 0.0  # accumulate SUM (not mean)
+        va_sum, n_va = 0.0, 0
 
         pbar_val = tqdm(dl_va, desc="Validating", unit="batch", leave=False)
         with torch.no_grad():
             for x_start, t_start, dt_seq, x_future, y_future in pbar_val:
+                # x_future: [B, H, D], y_future: [B, H, 2]
                 B, H, D = x_future.shape
                 x_future = x_future.to(device)
                 y_gt     = y_future.to(device)
                 t0       = t_start.to(device).view(B, 1)
                 dt_seq   = dt_seq.to(device)
 
-                # absolute times: [B,H]
-                t_abs = t0 + torch.cumsum(dt_seq, dim=1)
+                # Absolute times per step: t_h = t0 + cumsum(dt_seq)
+                t_abs = t0 + torch.cumsum(dt_seq, dim=1)   # [B, H]
 
-                # predict Y from true X at SAME times
+                # Predict Y directly from ground-truth X at SAME times
                 y_preds = []
                 for h in range(H):
-                    x_h = x_future[:, h, :]
-                    t_h = t_abs[:, h]
-                    y_hat_h = readout(x_h, t_h)
+                    x_h = x_future[:, h, :]         # [B, D]
+                    t_h = t_abs[:, h]               # [B]
+                    y_hat_h = readout(x_h, t_h)     # [B, 2]
                     y_preds.append(y_hat_h.unsqueeze(1))
-                y_preds = torch.cat(y_preds, dim=1)  # [B,H,2]
+                y_preds = torch.cat(y_preds, dim=1) # [B, H, 2]
 
-                # SUM reduction over batch & horizon
-                batch_sum = F.mse_loss(y_preds, y_gt, reduction="sum")
-                va_sum += float(batch_sum.item())
-                pbar_val.set_postfix(sum_loss=f"{va_sum:.2f}")
+                # Mean MSE per element as validation metric (stable wrt batch/horizon)
+                batch_loss = F.mse_loss(y_preds, y_gt, reduction="sum")
+                va_sum += batch_loss.item()
+                n_va   += B * H * 2  # elements
+                pbar_val.set_postfix(val_mse=f"{(va_sum/max(1,n_va)):.6e}")
         pbar_val.close()
 
-        sched.step(va_sum)
-        print(f"Epoch {ep:03d} | train_mean={tr_loss_mean:.6f} | val_y_same_time_SUM={va_sum:.2f}")
+        va_mse = va_sum / max(1, n_va)
+        sched.step(va_mse)
+        print(f"Epoch {ep:03d} | val_same_time_Y_mse={va_mse:.6e}")
 
-        # ---------------- Early stopping / Improvement trigger ----------------
-        if va_sum + 1e-9 < best_val_sum:
-            best_val_sum = va_sum
+        # Early stopping on validation metric; keep best state in memory
+        if va_mse + 1e-12 < best_val:
+            best_val = va_mse
             patience_ct = 0
-
-            # On improvement, write predictions CSV from test.csv (denormalized)
-            write_predictions_csv_from_df(
-                readout=readout,
-                df_test=df_test,
-                x_mean=x_mean, x_std=x_std,
-                y_mean=y_mean, y_std=y_std,
-                out_path=pred_out_path
-            )
+            best_state = {
+                "f": model_f.state_dict(),
+                "g": model_g.state_dict(),
+                "h": readout.state_dict(),
+            }
         else:
             patience_ct += 1
             if patience_ct >= patience:
-                print(f"[info] Early stopping at epoch {ep}. Best val SUM={best_val_sum:.2f}")
+                print(f"[info] Early stopping at epoch {ep}. Best val mse={best_val:.6e}")
                 break
+
+    # Load best state before returning
+    if best_state is not None:
+        model_f.load_state_dict(best_state["f"])
+        model_g.load_state_dict(best_state["g"])
+        readout.load_state_dict(best_state["h"])
+
+    return best_val
+
+
+# =============================
+# Inference on test + CSV write
+# =============================
+@torch.no_grad()
+def predict_test_and_write_csv(
+    readout: ReadoutNet, test_df: pd.DataFrame, out_csv: str, batch_size: int = 1024
+):
+    readout.to(device).eval()
+    td = TestDataset(test_df)
+    dl = DataLoader(td, batch_size=batch_size, shuffle=False, drop_last=False)
+
+    ids_all: List[int] = []
+    y1_all: List[float] = []
+    y2_all: List[float] = []
+
+    for batch in tqdm(dl, desc="Predicting test", unit="batch", leave=False):
+        ids, x, t = batch
+        x = x.to(device)
+        t = t.to(device)
+
+        y_hat = readout(x, t)  # [B, 2]
+        y1_all.extend(y_hat[:, 0].cpu().numpy().tolist())
+        y2_all.extend(y_hat[:, 1].cpu().numpy().tolist())
+        ids_all.extend([int(i) for i in ids])
+
+    out_df = pd.DataFrame({"id": ids_all, "Y1": y1_all, "Y2": y2_all})
+    out_df.to_csv(out_csv, index=False)
+    print(f"[info] Wrote predictions to {out_csv} ({len(out_df)} rows)")
 
 
 # =============================
 # Main
 # =============================
 def main():
-    parser = argparse.ArgumentParser(description="Train f/g/h with RK4; write predictions on best val.")
-    parser.add_argument("--train_csv", type=str, default="../research/data/train.csv",
-                        help="Path to training CSV with columns: time,A..N,Y1,Y2")
-    parser.add_argument("--test_csv", type=str, default="../research/data/test.csv",
-                        help="Path to test CSV with columns: id,time,A..N")
-    parser.add_argument("--out_csv", type=str, default="./artifacts/predictions2.csv",
-                        help="Path to write predictions CSV (id,Y1,Y2)")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--val_frac", type=float, default=0.15)
-    parser.add_argument("--horizon", type=int, default=20)
-    parser.add_argument("--epochs", type=int, default=300)
-    parser.add_argument("--batch_size", type=int, default=528)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser = argparse.ArgumentParser(description="Train PINN-like model and predict on test.")
+    parser.add_argument("--train_csv", type=str, required=True, help="Path to train.csv (time,A..N,Y1,Y2).")
+    parser.add_argument("--test_csv",  type=str, required=True, help="Path to test.csv (time,A..N,[id]).")
+    parser.add_argument("--out_csv",   type=str, default="predictions.csv", help="Output CSV path (id,Y1,Y2).")
+    parser.add_argument("--seed",      type=int, default=42)
+    parser.add_argument("--epochs",    type=int, default=300)
+    parser.add_argument("--batch_size",type=int, default=512)
+    parser.add_argument("--horizon",   type=int, default=20, help="Validation window length.")
+    parser.add_argument("--lr",        type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--hidden", type=int, default=128)
-    parser.add_argument("--depth_f", type=int, default=4)
-    parser.add_argument("--depth_g", type=int, default=3)
-    parser.add_argument("--depth_h", type=int, default=2)
-    # loss weights
-    parser.add_argument("--w_forward", type=float, default=1.0)
-    parser.add_argument("--w_backward", type=float, default=1.0)
-    parser.add_argument("--w_cycle", type=float, default=0.5)
-    parser.add_argument("--w_xnext_direct", type=float, default=1.0)
-    parser.add_argument("--w_y_now", type=float, default=1.0)
-    parser.add_argument("--w_y_next_via_rk4", type=float, default=0.25)
-    parser.add_argument("--w_y_next_via_g", type=float, default=0.25)
-    parser.add_argument("--patience", type=int, default=30)
+    parser.add_argument("--patience",  type=int, default=30)
+    parser.add_argument("--hidden",    type=int, default=128)
+    parser.add_argument("--depth_f",   type=int, default=4)
+    parser.add_argument("--depth_g",   type=int, default=3)
+    parser.add_argument("--depth_h",   type=int, default=2)
     args = parser.parse_args()
 
-    # Repro
     set_seed(args.seed)
 
-    # Load CSVs
-    df_train = load_train_csv(args.train_csv)
-    df_test  = load_test_csv(args.test_csv)
+    # Load data
+    train_df = load_train_csv(args.train_csv)
+    test_df  = load_test_csv(args.test_csv)
 
-    # Build pair dataset to extract scalers from train
-    full_pairs = PairDataset(df_train)
-    x_mean, x_std = full_pairs.x_mean, full_pairs.x_std
-    y_mean, y_std = full_pairs.y_mean, full_pairs.y_std
+    # Build datasets
+    full_pairs = PairDataset(train_df)
 
-    # Split indices for pairs
+    # Validation windows from the same train_df (same-time Y only)
+    val_ds = ValDatasetSameTimeY(train_df, horizon=args.horizon)
+
+    # Simple random split of pair indices for training (pairs only affect reconstruction terms)
     N = len(full_pairs)
-    n_val = max(1, int(args.val_frac * N))
+    if N < 2:
+        raise ValueError("Not enough consecutive pairs in train.csv (need at least 2 rows with strictly increasing time).")
     perm = np.random.permutation(N)
-    val_idx, tr_idx = perm[:n_val], perm[n_val:]
+    # Use all pairs for training since validation metric is computed from ValDatasetSameTimeY
+    train_idx = perm
 
-    # Train split using same scalers
-    train_ds_all = PairDataset(df_train, scaler_state=(x_mean, x_std), scaler_target=(y_mean, y_std))
-
+    # Subset the training pairs
     def subset_pairs(ds: PairDataset, idxs: np.ndarray) -> PairDataset:
         sub = PairDataset.__new__(PairDataset)
         sub.t0 = ds.t0[idxs]; sub.t1 = ds.t1[idxs]; sub.dt = ds.dt[idxs]
         sub.x0 = ds.x0[idxs]; sub.x1 = ds.x1[idxs]
-        sub.x0_raw = ds.x0_raw[idxs]; sub.x1_raw = ds.x1_raw[idxs]
         sub.y0 = ds.y0[idxs]; sub.y1 = ds.y1[idxs]
-        sub.y0_raw = ds.y0_raw[idxs]; sub.y1_raw = ds.y1_raw[idxs]
-        sub.x_mean = ds.x_mean; sub.x_std = ds.x_std
-        sub.y_mean = ds.y_mean; sub.y_std = ds.y_std
         return sub
 
-    train_ds = subset_pairs(train_ds_all, tr_idx)
-
-    # Validation set (same-time Y only) with same scalers
-    val_ds = ValDatasetSameTimeY(
-        df_train, mean_x=x_mean, std_x=x_std, mean_y=y_mean, std_y=y_std, horizon=args.horizon
-    )
+    train_ds = subset_pairs(full_pairs, train_idx)
 
     # Models
-    x_dim = len(STATE_COLS)  # 14
-    y_dim = len(TARGETS)     # 2
+    x_dim = len(STATE_COLS)
+    y_dim = len(TARGETS)
     model_f = DynamicsNet(x_dim=x_dim, hidden=args.hidden, depth=args.depth_f)
     model_g = NextStepNet(x_dim=x_dim, hidden=max(64, args.hidden), depth=args.depth_g)
     readout = ReadoutNet(x_dim=x_dim, y_dim=y_dim, hidden=max(64, args.hidden // 2), depth=args.depth_h)
 
     print("[info] Training start")
-    train_loop(
+    _ = train_loop(
         model_f=model_f,
         model_g=model_g,
         readout=readout,
         train_ds=train_ds,
         val_ds=val_ds,
-        df_test=df_test,
-        pred_out_path=args.out_csv,
-        x_mean=x_mean, x_std=x_std, y_mean=y_mean, y_std=y_std,
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
         weight_decay=args.weight_decay,
-        w_forward=args.w_forward,
-        w_backward=args.w_backward,
-        w_cycle=args.w_cycle,
-        w_xnext_direct=args.w_xnext_direct,
-        w_y_now=args.w_y_now,
-        w_y_next_via_rk4=args.w_y_next_via_rk4,
-        w_y_next_via_g=args.w_y_next_via_g,
         patience=args.patience,
     )
+
+    # Inference on test + CSV write (using best in-memory weights)
+    predict_test_and_write_csv(readout, test_df, args.out_csv, batch_size=max(512, args.batch_size))
 
 
 if __name__ == "__main__":
