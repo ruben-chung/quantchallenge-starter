@@ -58,7 +58,21 @@ def set_seed(seed: int = 42):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
+    
+    
+# =============================
+# Model save
+# =============================
+def save_checkpoint(save_path: str, model_f, model_g, readout, extra: dict = None):
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    payload = {
+        "model_f": model_f.state_dict(),
+        "model_g": model_g.state_dict(),
+        "readout": readout.state_dict(),
+    }
+    if extra:
+        payload.update(extra)
+    torch.save(payload, save_path)
 
 # =============================
 # Data loading
@@ -316,17 +330,16 @@ def train_loop(
     batch_size: int = 128,
     lr: float = 1e-3,
     weight_decay: float = 1e-4,
-    # reconstruction weights (via RK4/f)
     w_forward: float = 1.0,
     w_backward: float = 1.0,
     w_cycle: float = 0.5,
-    # direct next-step X (via g)
     w_xnext_direct: float = 1.0,
-    # Y supervision (same-time required; next-time optional anchors)
     w_y_now: float = 1.0,
     w_y_next_via_rk4: float = 0.25,
     w_y_next_via_g: float = 0.25,
     patience: int = 30,
+    save_path: Optional[str] = None,           # <— NEW
+    save_extra: Optional[dict] = None,         # <— NEW (scalers, metadata, etc.)
 ):
     """
     Train with:
@@ -461,6 +474,11 @@ def train_loop(
         if va_loss + 1e-9 < best_val:
             best_val = va_loss
             patience_ct = 0
+
+            # --- SAVE BEST ---
+            if save_path is not None:
+                save_checkpoint(save_path, model_f, model_g, readout, save_extra)
+                print("saved")  # exactly as requested
         else:
             patience_ct += 1
             if patience_ct >= patience:
@@ -546,6 +564,27 @@ def main():
     model_g = NextStepNet(x_dim=x_dim, hidden=max(64, hidden), depth=depth_g)
     readout = ReadoutNet(x_dim=x_dim, y_dim=y_dim, hidden=max(64, hidden // 2), depth=depth_h)
 
+    # Saving parameters
+    out_dir = "./artifacts"
+    save_path = os.path.join(out_dir, "best_model.pt")
+
+    save_extra = {
+        "x_mean": x_mean,
+        "x_std": x_std,
+        "y_mean": y_mean,
+        "y_std": y_std,
+        "meta": {
+            "csv_path": csv_path,
+            "horizon": horizon,
+            "hidden": hidden,
+            "depth_f": depth_f,
+            "depth_g": depth_g,
+            "depth_h": depth_h,
+            "seed": seed,
+        }
+    }
+
+
     print("[info] Training start")
     train_loop(
         model_f=model_f,
@@ -557,12 +596,14 @@ def main():
         batch_size=batch_size,
         lr=lr,
         weight_decay=weight_decay,
-        # weights
         w_forward=w_forward, w_backward=w_backward, w_cycle=w_cycle,
         w_xnext_direct=w_xnext_direct,
         w_y_now=w_y_now, w_y_next_via_rk4=w_y_next_via_rk4, w_y_next_via_g=w_y_next_via_g,
         patience=patience,
+        save_path=save_path,          # <— NEW
+        save_extra=save_extra,        # <— NEW
     )
+
 
 
 if __name__ == "__main__":
