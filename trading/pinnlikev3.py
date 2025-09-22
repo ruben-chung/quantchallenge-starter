@@ -475,10 +475,9 @@ def train_loop(
             best_val = va_loss
             patience_ct = 0
 
-            # --- SAVE BEST ---
-            if save_path is not None:
-                save_checkpoint(save_path, model_f, model_g, readout, save_extra)
-                print("saved")  # exactly as requested
+
+            save_checkpoint(save_path, model_f, model_g, readout, save_extra)
+            print("saved")  # exactly as requested
         else:
             patience_ct += 1
             if patience_ct >= patience:
