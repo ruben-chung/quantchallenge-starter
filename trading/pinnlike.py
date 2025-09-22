@@ -21,6 +21,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+from tqdm import tqdm
+
+
+
+
 
 
 # =============================
@@ -234,6 +239,7 @@ def train_loop(
     w_cycle: float = 0.5,
     patience: int = 30,
 ):
+ 
     """
     Train with reconstruction losses on consecutive pairs.
     Validate ONLY by multi-step future prediction (rollouts).
@@ -245,17 +251,23 @@ def train_loop(
 
     dl_tr = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
     # batch_size=1 for per-trajectory rollout; keep shapes consistent
-    dl_va = DataLoader(val_ds, batch_size=1, shuffle=False, drop_last=False)
+    dl_va = DataLoader(val_ds, batch_size=batch_size, shuffle=False, drop_last=False)
 
     best_val = float("inf")
     patience_ct = 0
+
+    # =============================
+    # Progress Bar
+    # =============================
+    tr_sum, n_tr = 0.0, 0
+    pbar_train = tqdm(dl_tr, desc="Training", unit="batch")
 
     for ep in range(1, epochs + 1):
         # ---------------- Train (reconstruction) ----------------
         model_f.train()
         tr_sum, n_tr = 0.0, 0
 
-        for x0, t0, x1, t1, dt in dl_tr:
+        for x0, t0, x1, t1, dt in pbar_train:
             x0, x1 = x0.to(device), x1.to(device)
             t0, t1, dt = t0.to(device), t1.to(device), dt.to(device)
 
@@ -281,31 +293,48 @@ def train_loop(
             tr_sum += loss.item() * bs
             n_tr += bs
 
-        tr_loss = tr_sum / max(1, n_tr)
+            tr_loss = tr_sum / max(1, n_tr)
+            pbar_train.set_postfix(loss=f"{tr_loss:.4f}")
+        pbar_train.close()
+
+        print("training done, starting validation...")
 
         # ---------------- Validation (future prediction ONLY) ----------------
         model_f.eval()
         va_sum, n_va = 0.0, 0
+        pbar_val = tqdm(dl_va, desc="Validating", unit="batch")
+
         with torch.no_grad():
-            for x_start, t_start, dt_seq, x_future in dl_va:
-                # Shapes with batch_size=1:
-                # x_start : [1, D]     t_start : [1]
-                # dt_seq  : [1, H]     x_future: [1, H, D]
-                x = x_start.to(device)                 # [1, D]
-                t = t_start.to(device).view(-1)        # [1]
-                dt_seq = dt_seq.to(device).view(-1)    # [H]
-                gt = x_future.to(device).squeeze(0)    # [H, D]  <-- now H matches preds
+            for x_start, t_start, dt_seq, x_future in pbar_val:
+                # Expected shapes:
+                # x_start : [B, D]
+                # t_start : [B]
+                # dt_seq  : [B, H]
+                # x_future: [B, H, D]
+                B, H, D = x_future.shape
+
+                x = x_start.to(device)                 # [B, D]
+                t = t_start.to(device).view(B, 1)      # [B, 1]
+                dt_seq = dt_seq.to(device)             # [B, H]
+                gt = x_future.to(device)               # [B, H, D]
 
                 preds = []
-                for h in range(dt_seq.shape[0]):
-                    dt_h = dt_seq[h].view(1)           # [1]
-                    x = rk4_step(x, t, dt_h, model_f)  # x stays [1, D]
-                    t = t + dt_h                       # [1]
-                    preds.append(x.squeeze(0))         # [D]
-                preds = torch.stack(preds, dim=0)      # [H, D]
+                for h in range(H):
+                    dt_h = dt_seq[:, h].view(B, 1)          # [B, 1]
+                    x = rk4_step(x, t, dt_h, model_f)       # [B, D]
+                    t = t + dt_h                            # [B, 1]
+                    preds.append(x.unsqueeze(1))            # [B, 1, D]
 
-                va_sum += F.mse_loss(preds, gt).item() * gt.shape[0]
-                n_va += gt.shape[0]
+                preds = torch.cat(preds, dim=1)             # [B, H, D]
+
+                # MSE over all elements (sum reduced by H*B for average later)
+                batch_loss = F.mse_loss(preds, gt, reduction="sum")
+                va_sum += batch_loss.item()
+                n_va += B * H
+
+                va_loss = va_sum / max(1, n_va)
+                pbar_val.set_postfix(loss=f"{va_loss:.4f}")
+        pbar_val.close()
 
         va_loss = va_sum / max(1, n_va)
         sched.step(va_loss)
@@ -338,7 +367,7 @@ def main():
     depth       = 4
 
     epochs      = 300
-    batch_size  = 128
+    batch_size  = 528
     lr          = 1e-3
     weight_decay= 1e-4
 
@@ -380,6 +409,8 @@ def main():
     # Model
     x_dim = len(STATE_COLS)  # 14
     model_f = DynamicsNet(x_dim=x_dim, hidden=hidden, depth=depth)
+
+    print("training start")
 
     # Train
     train_loop(
