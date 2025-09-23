@@ -102,8 +102,6 @@ class Strategy:
         # Quoting params (tune safely)
         self.depth: int = 5                 # VW over top N levels
         self.inside_frac: float = 0.25      # fraction of spread toward mid
-        self.base_qty: float = 5.0          # base order size
-        self.max_qty: float = 20.0          # cap by imbalance scaling
         self.tick_size: float = 0.5         # price tick granularity
         self.price_epsilon: float = 0.01    # min change to replace
         self._did_sanity: bool = False
@@ -114,6 +112,31 @@ class Strategy:
         self._rl_tokens = self._rl_capacity
         self._rl_refill_per_sec = 30.0 / 60.0
         self._rl_last_t = time.monotonic()
+
+        # ───────── Enhancements: risk/vol/cooldown/health ─────────
+        # inventory skew & churn guard
+        self.kappa: float = 0.02              # inventory skew per unit position (price units)
+        self.min_order_life: float = 0.80     # seconds before we allow a replace on the same side
+        self._bid_ts: Optional[float] = None
+        self._ask_ts: Optional[float] = None
+
+        # volatility-aware quoting
+        self.c_vol: float = 0.50              # widen factor versus vol
+        self.vol_ref: float = 0.002           # reference vol (fractional mid move)
+        self.vol_window: deque = deque(maxlen=60)
+        self._last_mid: Optional[float] = None
+
+        # dynamic cooldown exit based on book health
+        self.dynamic_cooldown: bool = True
+        self.health_spread_max: float = 3.0    # don’t quote if spread wider than this
+        self.health_min_depth: float = 20.0    # min combined top-N depth to consider healthy
+        self._good_book_streak: int = 0
+
+        # risk sizing knobs
+        self.contract_value: float = 1.0     # $ P&L per 1 price-unit per 1 qty
+        self.fill_risk_bp: float = 2.0       # per-fill risk budget (bp of capital)
+        self.max_inv_frac: float = 0.02      # max net inventory notional as fraction of capital
+        self.depth_frac_cap: float = 0.25    # cap size as fraction of displayed depth
 
         # Ensure engine funcs are bound
         self._ensure_api()
@@ -144,7 +167,6 @@ class Strategy:
         now = time.monotonic()
         dt = max(0.0, now - self._rl_last_t)
         self._rl_last_t = now
-        # refill
         self._rl_tokens = min(self._rl_capacity, self._rl_tokens + dt * self._rl_refill_per_sec)
         if self._rl_tokens >= cost:
             self._rl_tokens -= cost
@@ -160,7 +182,7 @@ class Strategy:
         t = self.tick_size
         return round(px / t) * t
 
-    # ───────── Book builders ─────────
+    # ───────── Book helpers ─────────
     def _rebuild_books(self, bids: list, asks: list) -> None:
         """Rebuild the full local book from snapshot arrays of [price, qty]."""
         self._bids.clear(); self._asks.clear()
@@ -211,8 +233,10 @@ class Strategy:
             return False
         if not self._rl_allow(1.0):
             return False
-        # tolerate either actual Enum or string
-        side = Side.BUY if want_buy else Side.SELL if self._Side is Side else ("BUY" if want_buy else "SELL")
+        if self._Side:
+            side = self._Side.BUY if want_buy else self._Side.SELL
+        else:
+            side = Side.BUY if want_buy else Side.SELL
         try:
             return bool(self._fn_place_market(side, self._ticker, float(qty)))
         except Exception:
@@ -224,7 +248,10 @@ class Strategy:
             return None
         if not self._rl_allow(1.0):
             return None
-        side = Side.BUY if want_buy else Side.SELL if self._Side is Side else ("BUY" if want_buy else "SELL")
+        if self._Side:
+            side = self._Side.BUY if want_buy else self._Side.SELL
+        else:
+            side = Side.BUY if want_buy else Side.SELL
         try:
             return self._fn_place_limit(side, self._ticker, float(qty), float(price), bool(ioc))
         except Exception:
@@ -242,6 +269,65 @@ class Strategy:
             self._fn_cancel(self._ticker, oid)
         except Exception:
             pass
+
+    # ───────── Health/vol helpers ─────────
+    def _book_health(self) -> bool:
+        """Simple health check: spread tight enough and top-N depth sufficient."""
+        if not (self._best_bid and self._best_ask):
+            return False
+        best_spread = self._best_ask[0] - self._best_bid[0]
+        if best_spread > self.health_spread_max:
+            return False
+        take = max(1, int(self.depth))
+        bid_depth = sum(self._bids.get(p, 0.0) for p in self._bid_prices[:take])
+        ask_depth = sum(self._asks.get(p, 0.0) for p in self._ask_prices[:take])
+        return (bid_depth + ask_depth) >= self.health_min_depth
+
+    def _update_vol(self, mid: float) -> float:
+        """Update and return rolling absolute return volatility (fractional)."""
+        if self._last_mid is not None and self._last_mid > 0:
+            ret = abs(mid / self._last_mid - 1.0)
+            self.vol_window.append(ret)
+        self._last_mid = mid
+        if not self.vol_window:
+            return 0.0
+        sorted_rets = sorted(self.vol_window)
+        m = sorted_rets[len(sorted_rets)//2]
+        return m * 1.4826  # ~robust std from MAD for Laplace-ish tails
+
+    # ───────── Risk sizing helper ─────────
+    def _safe_qty(self, mid: float, spread: float, vol_frac: float,
+                  side_is_bid: bool, displayed_depth: float) -> float:
+        """
+        Return a per-order quantity bounded by:
+          • per-fill risk budget (bp of capital)
+          • max inventory vs capital
+          • fraction of displayed depth
+        """
+        # estimate capital if not provided by engine yet
+        est_cap = self.capital_remaining
+        if est_cap is None:
+            est_cap = self.cash + abs(self.position) * max(mid, 1.0) * self.contract_value
+        cap = max(float(est_cap), 1.0)
+
+        # worst-case unit loss for a taker hit shortly after you quote
+        worst_move = 0.5 * spread + max(self.tick_size, 0.0) + 2.0 * vol_frac * max(mid, 1.0)
+        risk_per_unit = self.contract_value * max(worst_move, 1e-6)
+
+        # per-fill risk budget in $
+        risk_budget = (self.fill_risk_bp * 1e-4) * cap
+        q_risk = risk_budget / risk_per_unit
+
+        # inventory cap in qty: max notional = max_inv_frac * cap
+        max_inv_notional = self.max_inv_frac * cap
+        q_inv_cap = max_inv_notional / max(self.contract_value * max(mid, 1.0), 1e-6)
+
+        # depth cap
+        q_depth_cap = self.depth_frac_cap * max(displayed_depth, 0.0)
+
+        q = min(q_risk, q_inv_cap, q_depth_cap, float('inf'))
+        q = min(q, self._clamp(q, 0.0, self.max_qty))
+        return max(1.0, q)  # ensure at least 1 unit if allowed
 
     # ───────── Rollover helpers ─────────
     def _handle_rollover(self, reason: str) -> None:
@@ -275,6 +361,7 @@ class Strategy:
             pass
         self._best_bid = None; self._best_ask = None
         self._last_bid_px = None; self._last_ask_px = None
+        self._bid_ts = None; self._ask_ts = None
 
         # Start cooldown and clear stats
         now = time.time()
@@ -283,6 +370,7 @@ class Strategy:
         try: self._delta_window.clear()
         except Exception: self._delta_window = deque(maxlen=60)
         self._last_event_ts = None
+        self._good_book_streak = 0
         # print(f"[rollover] {reason} | cooldown={self.rollover_cooldown_sec}s")
 
     # ───────── Exchange callbacks ─────────
@@ -298,15 +386,22 @@ class Strategy:
         self._ticker = ticker
         self._apply_level_update(side, quantity, price)
 
-        # Pause quoting during rollover cooldown, but keep rebuilding the book
+        # Pause quoting during cooldown, but allow early exit if book looks healthy
         if time.time() < getattr(self, "_cooldown_until", 0.0):
+            if self.dynamic_cooldown and self._book_health():
+                self._good_book_streak += 1
+                if self._good_book_streak >= 3:   # 3 consecutive healthy snapshots
+                    self._cooldown_until = 0.0
+                    self._good_book_streak = 0
+            else:
+                self._good_book_streak = 0
             return
 
         # Compute VW prices at depth N
         def vw_best(prices: List[float], book: Dict[float, float], take_n: int, reverse: bool) -> Tuple[float, float]:
             if not prices:
                 return (0.0, 0.0)
-            pn = prices[:take_n] if not reverse else prices[:take_n]
+            pn = prices[:take_n]
             vol = 0.0; notional = 0.0
             for p in pn:
                 q = book.get(p, 0.0)
@@ -321,41 +416,80 @@ class Strategy:
             vwbid, bid_vol = vw_best(self._bid_prices, self._bids, self.depth, reverse=True)
             vwask, ask_vol = vw_best(self._ask_prices, self._asks, self.depth, reverse=False)
             if vwbid > 0 and vwask > 0:
-                mid = (vwbid + vwask) / 2.0
+                raw_mid = (vwbid + vwask) / 2.0
+                vol = self._update_vol(raw_mid)
+
+                # widen in high vol, tighten in low vol
+                widen = self.c_vol * min(1.0, vol / max(1e-9, self.vol_ref))
+                inside_frac_eff = max(0.10, min(0.45, self.inside_frac + widen))
+
                 spread = max(self._round_tick(vwask - vwbid), self.tick_size)
-                half = self.inside_frac * spread
+                half = inside_frac_eff * spread
+
+                # inventory skew: push prices away from current position
+                mid = raw_mid - self.kappa * self.position
+
                 target_bid_px = self._round_tick(max(vwbid, mid - half))
                 target_ask_px = self._round_tick(min(vwask, mid + half))
 
-                # Size leaning by displayed imbalance
-                tot = bid_vol + ask_vol
-                imb = ((bid_vol - ask_vol) / tot) if tot > 0 else 0.0      # [-1, 1]
-                bid_qty = self._clamp(self.base_qty * (1.0 + max(0.0, -imb)), 1.0, self.max_qty)
-                ask_qty = self._clamp(self.base_qty * (1.0 + max(0.0,  imb)), 1.0, self.max_qty)
+                # don’t quote if unhealthy book
+                if not self._book_health():
+                    return
 
-                # Replace only when needed
-                def needs_replace(prev_px: Optional[float], new_px: float) -> bool:
-                    if prev_px is None: return True
+                # displayed depth for sizing
+                take = max(1, int(self.depth))
+                displayed_bid_depth = sum(self._bids.get(p, 0.0) for p in self._bid_prices[:take])
+                displayed_ask_depth = sum(self._asks.get(p, 0.0) for p in self._ask_prices[:take])
+
+                # baseline size from risk/depth/capital
+                base_bid = self._safe_qty(raw_mid, spread, vol, True,  displayed_bid_depth)
+                base_ask = self._safe_qty(raw_mid, spread, vol, False, displayed_ask_depth)
+
+                # lean size by imbalance, but never exceed safe cap computed above
+                tot = bid_vol + ask_vol
+                imb = ((bid_vol - ask_vol) / tot) if tot > 0 else 0.0
+                tilt = 0.50
+                bid_qty = self._clamp(base_bid * (1.0 + tilt * max(0.0, -imb)), 1.0, base_bid)
+                ask_qty = self._clamp(base_ask * (1.0 + tilt * max(0.0,  imb)), 1.0, base_ask)
+
+                # Replace only when needed and after min order life
+                now = time.time()
+                def needs_replace(prev_px: Optional[float], prev_ts: Optional[float], new_px: float) -> bool:
+                    if prev_px is None:
+                        return True
+                    if prev_ts is not None and (now - prev_ts) < self.min_order_life:
+                        return False
                     eps = max(self.price_epsilon, self.tick_size * 0.5)
                     return abs(prev_px - new_px) > eps
 
                 # Bid
-                if needs_replace(self._last_bid_px, target_bid_px):
+                if needs_replace(self._last_bid_px, self._bid_ts, target_bid_px):
                     if self._bid_oid is not None:
                         self._cancel(self._bid_oid); self._bid_oid = None
                     oid = self._place_limit(True, bid_qty, target_bid_px, ioc=False)
                     if oid is not None:
                         self._bid_oid = oid
                         self._last_bid_px = target_bid_px
+                        self._bid_ts = now
 
                 # Ask
-                if needs_replace(self._last_ask_px, target_ask_px):
+                if needs_replace(self._last_ask_px, self._ask_ts, target_ask_px):
                     if self._ask_oid is not None:
                         self._cancel(self._ask_oid); self._ask_oid = None
                     oid = self._place_limit(False, ask_qty, target_ask_px, ioc=False)
                     if oid is not None:
                         self._ask_oid = oid
                         self._last_ask_px = target_ask_px
+                        self._ask_ts = now
+
+    def on_orderbook_snapshot(self, ticker: Ticker, bids: list, asks: list) -> None:
+        """Optional full snapshot handler: rebuild then reuse the same quoting logic via updates."""
+        self._ticker = ticker
+        self._rebuild_books(bids, asks)
+
+        # during cooldown, let dynamic exit logic happen in incremental updates
+        if time.time() < getattr(self, "_cooldown_until", 0.0):
+            return
 
     def on_account_update(self, *args, **kwargs) -> None:
         """
@@ -489,7 +623,3 @@ class Strategy:
 
         self._last_score_sum = curr_sum
         self._last_event_ts = now
-
-#18k lets go
-#14k
-#11k
