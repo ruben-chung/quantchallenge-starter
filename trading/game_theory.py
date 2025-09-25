@@ -1,11 +1,8 @@
-"""
-Quant Challenge 2025
 
-Algorithmic strategy – VW spread maker with full local orderbook and 30/min rate limit
-"""
 
 from __future__ import annotations
 import time
+import random
 from enum import Enum
 from typing import Optional, Dict, List, Tuple
 from collections import deque
@@ -42,22 +39,14 @@ def cancel_order(ticker: Ticker, order_id: int) -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class Strategy:
-    """Simple volume-weighted spread maker.
-
-    • Maintains a complete local orderbook from snapshots + incremental updates
-    • Quotes one bid + one ask inside the spread (VW top-N levels)
-    • One-time sanity cross on first two-sided book to prove trading path
-    • Respects rate limit: 30 orders/min (place + cancel counted)
-    • Updates position/cash on fills (account updates)
-    • Handles game rollover in continuous feeds (cooldown + optional flatten)
-    """
+    """Volume-weighted spread maker, hardened for adversarial bots."""
 
     # ───────── Lifecycle ─────────
     def __init__(self) -> None:
         self.reset_state()
 
     def reset_state(self) -> None:
-        # Engine enums/functions resolved at runtime (robust to import-time stubs)
+        # Engine enums/functions resolved at runtime
         self._Side = None
         self._Ticker = None
         self._fn_place_market = None
@@ -75,41 +64,64 @@ class Strategy:
         self._best_bid: Optional[Tuple[float, float]] = None
         self._best_ask: Optional[Tuple[float, float]] = None
 
+        # Per-price persistence (anti-spoof)
+        # key: (side_str, price) -> dict(last_seen, present, score)
+        self._level_meta: Dict[Tuple[str, float], Dict[str, float]] = {}
+
         # Our resting orders (one bid + one ask) and last posted prices
         self._bid_oid: Optional[int] = None
         self._ask_oid: Optional[int] = None
         self._last_bid_px: Optional[float] = None
         self._last_ask_px: Optional[float] = None
+        self._last_replace_ts = {"bid": 0.0, "ask": 0.0}
 
         # Position / PnL (tracked on our fills)
         self.position: float = 0.0
         self.cash: float = 0.0
         self.capital_remaining: Optional[float] = None
+        self.realized_pnl: float = 0.0
+        self.unrealized_pnl: float = 0.0
 
-        # ───────── Rollover detection state ─────────
+        # Risk limits
+        self.pos_max: float = 200.0              # hard inventory cap (tune to product)
+        self.drawdown_halt: float = -700.0       # stop if realized pnl below this since start (currency units)
+
+        # Rollover detection state
         self._last_score_sum: Optional[int] = None
-        self._delta_window: deque = deque(maxlen=60)  # rolling deltas
+        self._delta_window: deque = deque(maxlen=60)  # rolling deltas (score or synthetic flow)
         self._cooldown_until: float = 0.0
         self._last_event_ts: Optional[float] = None
 
-        # Rollover knobs (tune)
-        self.rollover_cooldown_sec: float = 4.0    # seconds to pause quoting
-        self.min_drop: int = 20                    # absolute score drop to flag rollover
-        self.frac_drop: float = 0.40               # fractional drop threshold
-        self.z_sigma: float = 4.0                  # z-score threshold for unusual negative jump
-        self.flatten_on_rollover: bool = True      # flatten inventory on rollover
+        # Rollover knobs
+        self.rollover_cooldown_sec: float = 6.0
+        self.min_drop: int = 20
+        self.frac_drop: float = 0.40
+        self.z_sigma: float = 4.0
+        self.flatten_on_rollover: bool = True
 
-        # Quoting params (tune safely)
+        # Quoting params
         self.depth: int = 5                 # VW over top N levels
         self.inside_frac: float = 0.25      # fraction of spread toward mid
         self.base_qty: float = 5.0          # base order size
         self.max_qty: float = 20.0          # cap by imbalance scaling
-        self.tick_size: float = 0.5         # price tick granularity
-        self.price_epsilon: float = 0.01    # min change to replace
+        self.tick_size: float = 0.5
+        self.price_epsilon: float = 0.01
         self._did_sanity: bool = False
         self._sanity_qty: float = 1.0
 
-        # Rate limit
+        # Toxicity/queue gates
+        self.toxicity_tau: float = 0.10     # post filters: tox > tau blocks bid, tox < -tau blocks ask
+        self.queue_join_max_frac: float = 0.8  # if our size would be >80% of displayed at top, skip
+
+        # Replace throttles
+        self.min_replace_dt: float = 0.7     # per-side throttle
+        self.cancel_then_place: bool = True  # batch cancels then places
+
+        # IOC feeler probability
+        self.feeler_prob: float = 0.05
+        self.feeler_qty: float = 0.5
+
+        # Rate limit (leaky bucket)
         self._rl_capacity = 30.0
         self._rl_tokens = self._rl_capacity
         self._rl_refill_per_sec = 30.0 / 60.0
@@ -139,12 +151,17 @@ class Strategy:
             if self._Ticker is not None and hasattr(self._Ticker, "TEAM_A"):
                 self._ticker = getattr(self._Ticker, "TEAM_A")
 
+    def _mk_side(self, want_buy: bool):
+        # Robust to stubbed or Enum side
+        if self._Side:
+            return self._Side.BUY if want_buy else self._Side.SELL
+        return "BUY" if want_buy else "SELL"
+
     # ───────── Rate limit: 30/min (leaky bucket) ─────────
     def _rl_allow(self, cost: float = 1.0) -> bool:
         now = time.monotonic()
         dt = max(0.0, now - self._rl_last_t)
         self._rl_last_t = now
-        # refill
         self._rl_tokens = min(self._rl_capacity, self._rl_tokens + dt * self._rl_refill_per_sec)
         if self._rl_tokens >= cost:
             self._rl_tokens -= cost
@@ -170,10 +187,12 @@ class Strategy:
             p = float(p); q = float(q)
             if q > 0:
                 self._bids[p] = q; self._bid_prices.append(p)
+                self._touch_level("BUY", p, present=True)
         for p, q in asks:
             p = float(p); q = float(q)
             if q > 0:
                 self._asks[p] = q; self._ask_prices.append(p)
+                self._touch_level("SELL", p, present=True)
 
         self._bid_prices.sort(reverse=True)
         self._ask_prices.sort()
@@ -185,6 +204,7 @@ class Strategy:
         """Apply incremental (side, quantity, price) to our local book."""
         p = float(price); q = float(quantity)
         is_bid = (side == Side.BUY) if isinstance(side, Side) else (getattr(side, "name", str(side)).upper() in ("BUY","BID"))
+        side_str = "BUY" if is_bid else "SELL"
         book = self._bids if is_bid else self._asks
         plist = self._bid_prices if is_bid else self._ask_prices
 
@@ -194,15 +214,106 @@ class Strategy:
                 del book[p]
                 try: plist.remove(p)
                 except ValueError: pass
+            # mark absence to decay persistence
+            self._touch_level(side_str, p, present=False)
         else:
             book[p] = q
             if not existed:
                 plist.append(p)
                 plist.sort(reverse=is_bid)
+            self._touch_level(side_str, p, present=True)
 
         # keep bests fresh
         self._best_bid = (self._bid_prices[0], self._bids[self._bid_prices[0]]) if self._bid_prices else None
         self._best_ask = (self._ask_prices[0], self._asks[self._ask_prices[0]]) if self._ask_prices else None
+
+    # ───────── Level persistence (anti-spoof) ─────────
+    def _touch_level(self, side_str: str, price: float, present: bool) -> None:
+        now = time.time()
+        k = (side_str, float(price))
+        meta = self._level_meta.get(k)
+        if meta is None:
+            # score in [0,1] ~ EWMA of presence
+            meta = {"last_seen": now, "present": 1.0 if present else 0.0, "score": 0.5}
+            self._level_meta[k] = meta
+            return
+        # EWMA update with time-aware decay
+        dt = max(0.0, now - meta["last_seen"])
+        alpha = 1.0 - pow(0.5, dt / 0.5)  # half-life 0.5s for presence memory
+        target = 1.0 if present else 0.0
+        meta["score"] = (1 - alpha) * meta["score"] + alpha * target
+        meta["present"] = 1.0 if present else 0.0
+        meta["last_seen"] = now
+
+    def _persistence_score(self, side_str: str, price: float) -> float:
+        meta = self._level_meta.get((side_str, float(price)))
+        if not meta:
+            return 0.5
+        # clamp to [0.05, 1.0] to avoid total collapse
+        return self._clamp(meta["score"], 0.05, 1.0)
+
+    # ───────── Microprice / toxicity / regime / queue helpers ─────────
+    def _micro_price(self) -> Tuple[float, float, float]:
+        if not (self._best_bid and self._best_ask):
+            return (0.0, 0.0, 0.0)
+        bb, qb = self._best_bid; ba, qa = self._best_ask
+        mid = (bb + ba) / 2.0
+        tot = max(1e-9, (qb + qa))
+        micro = (ba * qb + bb * qa) / tot
+        spread = max(self.tick_size, ba - bb)
+        skew = (micro - mid) / spread  # [-0.5, 0.5] roughly
+        return micro, mid, skew
+
+    def _toxicity(self) -> float:
+        micro, mid, skew = self._micro_price()
+        # negative deltas in _delta_window can be interpreted as sell-leaning tape here
+        d = list(self._delta_window)
+        last_n = d[-10:] if len(d) >= 10 else d
+        neg_share = sum(1 for x in last_n if x < 0) / max(1, len(last_n))
+        wide = 1.0 if (self._best_ask and self._best_bid and (self._best_ask[0] - self._best_bid[0] >= 2 * self.tick_size)) else 0.0
+        # combine; sign convention: positive toxicity -> bad for bids (sell pressure)
+        tox = 0.6 * skew + 0.3 * (neg_share - 0.5) + 0.1 * wide
+        return self._clamp(tox, -1.0, 1.0)
+
+    def _queue_rank(self, want_buy: bool) -> float:
+        book = self._bids if want_buy else self._asks
+        prices = self._bid_prices if want_buy else self._ask_prices
+        if not prices:
+            return 1.0
+        top = prices[0]; top_sz = book.get(top, 0.0)
+        # naive rank proxy: our size fraction if we joined with base_qty
+        frac = self.base_qty / max(1e-6, top_sz)
+        return self._clamp(frac, 0.0, 1.0)
+
+    def _risk_skew(self) -> float:
+        k = 0.02  # risk aversion per unit position (tune)
+        return self._clamp(-k * self.position, -0.5, 0.5)
+
+    def _regime(self) -> str:
+        if not (self._best_bid and self._best_ask):
+            return "idle"
+        s = self._best_ask[0] - self._best_bid[0]
+        churn = sum(1 for d in list(self._delta_window)[-20:] if d != 0)
+        if s >= 2 * self.tick_size or churn > 10:
+            return "volatile"
+        elif s <= self.tick_size and churn < 5:
+            return "stable"
+        return "normal"
+
+    # Depth-adaptive VW using persistence caps
+    def _vw(self, book: Dict[float, float], prices: List[float], take_n: int, side_str: str, cap: float = 10.0) -> Tuple[float, float]:
+        notional = 0.0; vol = 0.0
+        for p in prices[:take_n]:
+            q_raw = book.get(p, 0.0)
+            persist = self._persistence_score(side_str, p)
+            q = min(q_raw, cap) * persist
+            if q <= 0:
+                continue
+            notional += p * q
+            vol += q
+        if vol <= 0:
+            return (0.0, 0.0)
+        return (notional / vol, vol)
 
     # ───────── Order helpers ─────────
     def _place_market(self, want_buy: bool, qty: float) -> bool:
@@ -211,8 +322,7 @@ class Strategy:
             return False
         if not self._rl_allow(1.0):
             return False
-        # tolerate either actual Enum or string
-        side = Side.BUY if want_buy else Side.SELL if self._Side is Side else ("BUY" if want_buy else "SELL")
+        side = self._mk_side(want_buy)
         try:
             return bool(self._fn_place_market(side, self._ticker, float(qty)))
         except Exception:
@@ -224,7 +334,7 @@ class Strategy:
             return None
         if not self._rl_allow(1.0):
             return None
-        side = Side.BUY if want_buy else Side.SELL if self._Side is Side else ("BUY" if want_buy else "SELL")
+        side = self._mk_side(want_buy)
         try:
             return self._fn_place_limit(side, self._ticker, float(qty), float(price), bool(ioc))
         except Exception:
@@ -243,9 +353,30 @@ class Strategy:
         except Exception:
             pass
 
+    def _should_replace(self, prev_px: Optional[float], new_px: float, side_key: str, now: float) -> bool:
+        if prev_px is None:
+            return True
+        eps = max(self.price_epsilon, self.tick_size)  # hysteresis
+        moved = abs(prev_px - new_px) > eps
+        ok_time = (now - self._last_replace_ts.get(side_key, 0.0)) > self.min_replace_dt
+        jitter_ok = random.random() > 0.15  # 15% skip chance to break predictability
+        if moved and ok_time and jitter_ok:
+            self._last_replace_ts[side_key] = now
+            return True
+        return False
+
+    # ───────── Kill switches ─────────
+    def _risk_halts(self) -> bool:
+        # inventory
+        if abs(self.position) > self.pos_max:
+            return True
+        # drawdown (only if realized_pnl tracked)
+        if self.realized_pnl <= self.drawdown_halt:
+            return True
+        return False
+
     # ───────── Rollover helpers ─────────
     def _handle_rollover(self, reason: str) -> None:
-        """Trigger a new-game rollover: cancel quotes, optionally flatten, clear local book, and start cooldown."""
         # Cancel resting quotes
         if getattr(self, "_bid_oid", None) is not None:
             try: self._cancel(self._bid_oid)
@@ -285,6 +416,128 @@ class Strategy:
         self._last_event_ts = None
         # print(f"[rollover] {reason} | cooldown={self.rollover_cooldown_sec}s")
 
+    # ───────── Decision loop ─────────
+    def _decide_and_quote(self) -> None:
+        # Do nothing during cooldown or if risk halt engaged
+        if time.time() < getattr(self, "_cooldown_until", 0.0):
+            return
+        if self._risk_halts():
+            # Pull quotes if any
+            if self._bid_oid is not None:
+                self._cancel(self._bid_oid); self._bid_oid = None
+            if self._ask_oid is not None:
+                self._cancel(self._ask_oid); self._ask_oid = None
+            return
+
+        if not (self._bid_prices and self._ask_prices):
+            return
+
+        # Compute persistence-weighted VW bid/ask and volumes
+        vwbid, bid_vol = self._vw(self._bids, self._bid_prices, self.depth, "BUY")
+        vwask, ask_vol = self._vw(self._asks, self._ask_prices, self.depth, "SELL")
+        if not (vwbid > 0 and vwask > 0):
+            return
+
+        mid = (vwbid + vwask) / 2.0
+        spread_raw = max(self.tick_size, vwask - vwbid)
+        half = self.inside_frac * spread_raw
+
+        target_bid_px = self._round_tick(max(vwbid, mid - half))
+        target_ask_px = self._round_tick(min(vwask, mid + half))
+
+        # Size leaning by displayed imbalance
+        tot = bid_vol + ask_vol
+        imb = ((bid_vol - ask_vol) / tot) if tot > 0 else 0.0      # [-1, 1]
+        bid_qty = self._clamp(self.base_qty * (1.0 + max(0.0, -imb)), 1.0, self.max_qty)
+        ask_qty = self._clamp(self.base_qty * (1.0 + max(0.0,  imb)), 1.0, self.max_qty)
+
+        # Risk skew on price and size
+        r = self._risk_skew()
+        target_bid_px = self._round_tick(target_bid_px - r * self.tick_size)
+        target_ask_px = self._round_tick(target_ask_px + r * self.tick_size)
+        if r > 0:   # we are long; prefer to sell
+            bid_qty *= (1.0 - min(0.5, r))
+            ask_qty *= (1.0 + min(0.5, r))
+        elif r < 0: # we are short; prefer to buy
+            bid_qty *= (1.0 + min(0.5, -r))
+            ask_qty *= (1.0 - min(0.5, -r))
+
+        # Regime-dependent inside fraction and size adjustments
+        reg = self._regime()
+        if reg == "volatile":
+            inside_frac_old = self.inside_frac
+            self.inside_frac = 0.45
+            half = self.inside_frac * spread_raw
+            target_bid_px = self._round_tick(max(vwbid, mid - half))
+            target_ask_px = self._round_tick(min(vwask, mid + half))
+            bid_qty *= 0.6; ask_qty *= 0.6
+        elif reg == "stable":
+            self.inside_frac = 0.20
+            half = self.inside_frac * spread_raw
+            target_bid_px = self._round_tick(max(vwbid, mid - half))
+            target_ask_px = self._round_tick(min(vwask, mid + half))
+        else:
+            self.inside_frac = 0.25
+
+        # Toxicity and queue rank filters
+        tox = self._toxicity()
+        post_bid = tox <= self.toxicity_tau
+        post_ask = tox >= -self.toxicity_tau
+
+        if self._queue_rank(True) > self.queue_join_max_frac:
+            post_bid = False
+        if self._queue_rank(False) > self.queue_join_max_frac:
+            post_ask = False
+
+        now = time.time()
+
+        # Apply with hysteresis + rate limit budgeting (cancel-then-place batches)
+        if self.cancel_then_place:
+            # Bid side
+            if post_bid and self._should_replace(self._last_bid_px, target_bid_px, "bid", now):
+                if self._bid_oid is not None:
+                    self._cancel(self._bid_oid); self._bid_oid = None
+                oid = self._place_limit(True, bid_qty, target_bid_px, ioc=False)
+                if oid is not None:
+                    self._bid_oid = oid
+                    self._last_bid_px = target_bid_px
+            elif not post_bid and self._bid_oid is not None:
+                self._cancel(self._bid_oid); self._bid_oid = None
+
+            # Ask side
+            if post_ask and self._should_replace(self._last_ask_px, target_ask_px, "ask", now):
+                if self._ask_oid is not None:
+                    self._cancel(self._ask_oid); self._ask_oid = None
+                oid = self._place_limit(False, ask_qty, target_ask_px, ioc=False)
+                if oid is not None:
+                    self._ask_oid = oid
+                    self._last_ask_px = target_ask_px
+            elif not post_ask and self._ask_oid is not None:
+                self._cancel(self._ask_oid); self._ask_oid = None
+        else:
+            # Simple replace path
+            if post_bid and self._should_replace(self._last_bid_px, target_bid_px, "bid", now):
+                oid = self._place_limit(True, bid_qty, target_bid_px, ioc=False)
+                if oid is not None:
+                    if self._bid_oid is not None:
+                        self._cancel(self._bid_oid)
+                    self._bid_oid = oid
+                    self._last_bid_px = target_bid_px
+            if post_ask and self._should_replace(self._last_ask_px, target_ask_px, "ask", now):
+                oid = self._place_limit(False, ask_qty, target_ask_px, ioc=False)
+                if oid is not None:
+                    if self._ask_oid is not None:
+                        self._cancel(self._ask_oid)
+                    self._ask_oid = oid
+                    self._last_ask_px = target_ask_px
+
+        # Occasional IOC feeler on strong signal flips
+        if random.random() < self.feeler_prob:
+            if tox < -0.25 and post_bid is False and self._best_ask:
+                self._place_limit(True, self.feeler_qty, self._best_ask[0], ioc=True)
+            elif tox > 0.25 and post_ask is False and self._best_bid:
+                self._place_limit(False, self.feeler_qty, self._best_bid[0], ioc=True)
+
     # ───────── Exchange callbacks ─────────
     def on_trade_update(self, ticker: Ticker, side: Side, quantity: float, price: float) -> None:
         # Keep ticker fresh
@@ -292,70 +545,25 @@ class Strategy:
         # Cooldown: ignore trading logic during rollover
         if time.time() < getattr(self, "_cooldown_until", 0.0):
             return
-        # Strategy currently doesn't use last trade directly
+        # Could incorporate trade direction to _delta_window; here we leave to book deltas
 
     def on_orderbook_update(self, ticker: Ticker, side: Side, quantity: float, price: float) -> None:
         self._ticker = ticker
         self._apply_level_update(side, quantity, price)
 
-        # Pause quoting during rollover cooldown, but keep rebuilding the book
+        # During cooldown, only maintain book
         if time.time() < getattr(self, "_cooldown_until", 0.0):
             return
 
-        # Compute VW prices at depth N
-        def vw_best(prices: List[float], book: Dict[float, float], take_n: int, reverse: bool) -> Tuple[float, float]:
-            if not prices:
-                return (0.0, 0.0)
-            pn = prices[:take_n] if not reverse else prices[:take_n]
-            vol = 0.0; notional = 0.0
-            for p in pn:
-                q = book.get(p, 0.0)
-                vol += q
-                notional += p * q
-            if vol <= 0:
-                return (0.0, 0.0)
-            return (notional / vol, vol)
+        # One-time sanity cross on first healthy book
+        if not self._did_sanity and self._best_bid and self._best_ask:
+            if (self._best_ask[0] - self._best_bid[0]) <= 2 * self.tick_size:
+                self._place_limit(True, self._sanity_qty, self._best_ask[0], ioc=True)
+                self._place_limit(False, self._sanity_qty, self._best_bid[0], ioc=True)
+                self._did_sanity = True
 
-        # Compute mid using VW bests at depth
-        if self._bid_prices and self._ask_prices:
-            vwbid, bid_vol = vw_best(self._bid_prices, self._bids, self.depth, reverse=True)
-            vwask, ask_vol = vw_best(self._ask_prices, self._asks, self.depth, reverse=False)
-            if vwbid > 0 and vwask > 0:
-                mid = (vwbid + vwask) / 2.0
-                spread = max(self._round_tick(vwask - vwbid), self.tick_size)
-                half = self.inside_frac * spread
-                target_bid_px = self._round_tick(max(vwbid, mid - half))
-                target_ask_px = self._round_tick(min(vwask, mid + half))
-
-                # Size leaning by displayed imbalance
-                tot = bid_vol + ask_vol
-                imb = ((bid_vol - ask_vol) / tot) if tot > 0 else 0.0      # [-1, 1]
-                bid_qty = self._clamp(self.base_qty * (1.0 + max(0.0, -imb)), 1.0, self.max_qty)
-                ask_qty = self._clamp(self.base_qty * (1.0 + max(0.0,  imb)), 1.0, self.max_qty)
-
-                # Replace only when needed
-                def needs_replace(prev_px: Optional[float], new_px: float) -> bool:
-                    if prev_px is None: return True
-                    eps = max(self.price_epsilon, self.tick_size * 0.5)
-                    return abs(prev_px - new_px) > eps
-
-                # Bid
-                if needs_replace(self._last_bid_px, target_bid_px):
-                    if self._bid_oid is not None:
-                        self._cancel(self._bid_oid); self._bid_oid = None
-                    oid = self._place_limit(True, bid_qty, target_bid_px, ioc=False)
-                    if oid is not None:
-                        self._bid_oid = oid
-                        self._last_bid_px = target_bid_px
-
-                # Ask
-                if needs_replace(self._last_ask_px, target_ask_px):
-                    if self._ask_oid is not None:
-                        self._cancel(self._ask_oid); self._ask_oid = None
-                    oid = self._place_limit(False, ask_qty, target_ask_px, ioc=False)
-                    if oid is not None:
-                        self._ask_oid = oid
-                        self._last_ask_px = target_ask_px
+        # Drive decision loop
+        self._decide_and_quote()
 
     def on_account_update(self, *args, **kwargs) -> None:
         """
@@ -490,6 +698,4 @@ class Strategy:
         self._last_score_sum = curr_sum
         self._last_event_ts = now
 
-#18k lets go
-#14k
-#11k
+#-23k
