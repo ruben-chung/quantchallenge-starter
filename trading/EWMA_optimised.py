@@ -3,11 +3,12 @@ Quant Challenge 2025
 
 Algorithmic strategy – VW spread maker with full local orderbook and 30/min rate limit
 Volatility-harvesting + mean-revert exit + IV-based regime switching + adaptive MOMO skew
-+ Markout-aware quoting + Exit sub-budget + Dynamic inventory VAR cap
++ Markout-aware quoting + Exit sub-budget + Dynamic inventory VAR cap + Time-decay risk management
 """
 
 from __future__ import annotations
 import time
+import math
 from enum import Enum
 from typing import Optional, Dict, List, Tuple
 from collections import deque
@@ -67,6 +68,7 @@ class Strategy:
     • Markout-aware quoting (short-horizon toxicity filter)
     • Exit sub-budget (prevents IOC exits from consuming the full 30/min)
     • Dynamic inventory VAR cap (cap shrinks as intraday IV rises)
+    • Time-decay risk management (reduce position limits as event progresses)
     """
 
     # ───────── Lifecycle ─────────
@@ -178,6 +180,44 @@ class Strategy:
         self.min_pos_cap: float = 10.0           # never go below this
         self.varcap_flatten_bias: float = 0.5    # size scale when beyond cap
 
+        # Time-decay risk management attributes
+        self.event_start_time: Optional[float] = None
+        self.event_duration_minutes: float = 120.0  # Default 2 hours for most sports
+        self.game_phase: str = "UNKNOWN"  # PREGAME, Q1, Q2, HALFTIME, Q3, Q4, OVERTIME, FINAL
+        self.time_remaining_seconds: Optional[float] = None
+        
+        # Time-based risk scaling factors
+        self.time_decay_curve: str = "EXPONENTIAL"  # or "LINEAR" or "STEP"
+        self.late_game_threshold: float = 0.15  # Last 15% of game time
+        self.critical_threshold: float = 0.05   # Last 5% of game time
+        
+        # Position limit decay parameters
+        self.end_game_pos_mult: float = 0.3      # Reduce to 30% of normal at game end
+        self.halftime_pos_mult: float = 0.7      # Reduce to 70% during transition periods
+        self.overtime_pos_mult: float = 0.4      # Very conservative in overtime
+        
+        # Size scaling parameters
+        self.late_game_size_mult: float = 0.6    # Reduce order sizes in late game
+        self.critical_size_mult: float = 0.3     # Minimal sizes in final minutes
+        
+        # Spread widening parameters
+        self.late_game_spread_mult: float = 1.4   # Widen spreads 40% in late game
+        self.critical_spread_mult: float = 2.0    # Double spreads in critical periods
+        self.timeout_spread_mult: float = 1.3     # Widen during timeouts/breaks
+        
+        # Period transition detection
+        self.period_transition_window: float = 30.0  # 30 seconds around period changes
+        self.last_period_change: Optional[float] = None
+        self.in_transition: bool = False
+        
+        # Game situation tracking
+        self.score_differential: float = 0.0
+        self.is_close_game: bool = False
+        self.close_game_threshold: int = 7  # Within 7 points = close game
+        self.blowout_threshold: int = 20    # 20+ point differential = blowout
+        self._last_risk_log: float = 0.0
+        self._last_period: Optional[int] = None
+
         # Rolling mid stats
         self._mid_hist = deque(maxlen=self.vol_window)
         self._mid_diff_hist = deque(maxlen=self.vol_window)
@@ -250,6 +290,191 @@ class Strategy:
     @staticmethod
     def _clamp(x: float, lo: float, hi: float) -> float:
         return max(lo, min(hi, x))
+
+    # ───────── Time-decay risk management methods ─────────
+    def _initialize_event_timing(self) -> None:
+        """Initialize event timing when first game event is received"""
+        if self.event_start_time is None:
+            self.event_start_time = time.time()
+
+    def _update_game_context(self, **kwargs) -> None:
+        """Update game context from event data"""
+        # Extract timing information
+        period = kwargs.get('period', kwargs.get('quarter', None))
+        time_left = kwargs.get('time_remaining', kwargs.get('clock', None))
+        
+        # Update game phase
+        if period is not None:
+            if period == 0:
+                self.game_phase = "PREGAME"
+            elif period == 1:
+                self.game_phase = "Q1"
+            elif period == 2:
+                self.game_phase = "Q2" 
+            elif period == 3:
+                self.game_phase = "Q3"
+            elif period == 4:
+                self.game_phase = "Q4"
+            elif period > 4:
+                self.game_phase = "OVERTIME"
+            
+            # Check for halftime or period transitions
+            if hasattr(self, '_last_period') and self._last_period != period:
+                self.last_period_change = time.time()
+                self.in_transition = True
+            self._last_period = period
+        
+        # Update time remaining
+        if time_left is not None:
+            try:
+                if isinstance(time_left, str) and ':' in time_left:
+                    # Parse "MM:SS" format
+                    parts = time_left.split(':')
+                    self.time_remaining_seconds = int(parts[0]) * 60 + int(parts[1])
+                else:
+                    self.time_remaining_seconds = float(time_left)
+            except (ValueError, IndexError):
+                pass
+        
+        # Update score differential
+        home_score = kwargs.get('home_score', 0)
+        away_score = kwargs.get('away_score', 0)
+        try:
+            self.score_differential = abs(int(home_score) - int(away_score))
+            self.is_close_game = self.score_differential <= self.close_game_threshold
+        except (ValueError, TypeError):
+            pass
+
+    def _calculate_time_progress(self) -> float:
+        """Calculate how far through the event we are (0.0 to 1.0)"""
+        if self.time_remaining_seconds is not None:
+            # Use actual game clock if available
+            total_regulation_time = 60 * 60  # 60 minutes for most sports
+            if self.game_phase == "OVERTIME":
+                # In overtime, consider we're at 100%+ progress
+                return 1.0 + (600 - self.time_remaining_seconds) / 600.0  # 10min OT periods
+            else:
+                time_elapsed = total_regulation_time - self.time_remaining_seconds
+                return min(1.0, max(0.0, time_elapsed / total_regulation_time))
+        
+        elif self.event_start_time is not None:
+            # Fallback to wall clock time
+            elapsed_minutes = (time.time() - self.event_start_time) / 60.0
+            return min(1.0, max(0.0, elapsed_minutes / self.event_duration_minutes))
+        
+        return 0.0  # Unknown progress
+
+    def _check_transition_periods(self) -> bool:
+        """Check if we're in a period transition (high volatility time)"""
+        if self.last_period_change is None:
+            return False
+        
+        time_since_change = time.time() - self.last_period_change
+        if time_since_change <= self.period_transition_window:
+            return True
+        else:
+            self.in_transition = False
+            return False
+
+    def _calculate_time_decay_multipliers(self) -> Dict[str, float]:
+        """Calculate risk adjustment multipliers based on time progress"""
+        progress = self._calculate_time_progress()
+        is_transition = self._check_transition_periods()
+        
+        # Base multipliers
+        pos_mult = 1.0
+        size_mult = 1.0
+        spread_mult = 1.0
+        
+        # Handle different phases
+        if self.game_phase == "OVERTIME":
+            pos_mult = self.overtime_pos_mult
+            size_mult = self.critical_size_mult
+            spread_mult = self.critical_spread_mult
+            
+        elif is_transition or self.game_phase == "HALFTIME":
+            pos_mult = self.halftime_pos_mult
+            size_mult = 0.8
+            spread_mult = self.timeout_spread_mult
+            
+        elif progress >= (1.0 - self.critical_threshold):
+            # Final 5% of game - very conservative
+            pos_mult = self.end_game_pos_mult
+            size_mult = self.critical_size_mult
+            spread_mult = self.critical_spread_mult
+            
+        elif progress >= (1.0 - self.late_game_threshold):
+            # Late game (last 15%) - moderately conservative
+            # Smooth interpolation from normal to end-game values
+            late_progress = (progress - (1.0 - self.late_game_threshold)) / self.late_game_threshold
+            
+            if self.time_decay_curve == "EXPONENTIAL":
+                # Exponential decay - more aggressive near the end
+                decay_factor = math.exp(-3 * (1 - late_progress))
+            elif self.time_decay_curve == "LINEAR":
+                # Linear decay
+                decay_factor = 1 - late_progress
+            else:  # STEP
+                # Step function at critical threshold
+                decay_factor = 1.0 if late_progress < 0.67 else 0.5
+            
+            pos_mult = 1.0 - (1.0 - self.end_game_pos_mult) * (1 - decay_factor)
+            size_mult = 1.0 - (1.0 - self.late_game_size_mult) * (1 - decay_factor)
+            spread_mult = 1.0 + (self.late_game_spread_mult - 1.0) * (1 - decay_factor)
+        
+        # Additional adjustments for game situation
+        if self.is_close_game and progress > 0.8:
+            # Close games in final 20% - extra conservative
+            pos_mult *= 0.8
+            spread_mult *= 1.2
+            
+        elif self.score_differential >= self.blowout_threshold and progress < 0.8:
+            # Blowout games early - can be slightly more aggressive
+            pos_mult *= 1.1
+            spread_mult *= 0.95
+        
+        return {
+            "position_mult": pos_mult,
+            "size_mult": size_mult, 
+            "spread_mult": spread_mult,
+            "time_progress": progress
+        }
+
+    def _get_time_adjusted_position_cap(self) -> float:
+        """Get position cap adjusted for time decay"""
+        multipliers = self._calculate_time_decay_multipliers()
+        
+        # Start with your existing dynamic VAR cap
+        vol_in_ticks = (self._diff_std or 0.0) / max(self.tick_size, 1e-9)
+        base_cap = max(self.min_pos_cap, self.base_pos_cap / max(1.0, vol_in_ticks))
+        
+        # Apply time decay
+        time_adjusted_cap = base_cap * multipliers["position_mult"]
+        
+        return max(self.min_pos_cap * 0.5, time_adjusted_cap)  # Never go below 50% of min
+
+    def _get_time_adjusted_sizing(self, base_bid_qty: float, base_ask_qty: float) -> Tuple[float, float]:
+        """Get order sizes adjusted for time decay"""
+        multipliers = self._calculate_time_decay_multipliers()
+        size_mult = multipliers["size_mult"]
+        
+        adj_bid_qty = max(self._sanity_qty, base_bid_qty * size_mult)
+        adj_ask_qty = max(self._sanity_qty, base_ask_qty * size_mult)
+        
+        return adj_bid_qty, adj_ask_qty
+
+    def _get_time_adjusted_spreads(self, base_half_spread: float) -> float:
+        """Get half-spread adjusted for time decay"""
+        multipliers = self._calculate_time_decay_multipliers()
+        spread_mult = multipliers["spread_mult"]
+        
+        adjusted_half = base_half_spread * spread_mult
+        
+        # Ensure we don't go below minimum or above maximum
+        min_half = self.min_inside_ticks * self.tick_size
+        max_half = self.max_inside_ticks * self.tick_size * 1.5  # Allow extra wide in late game
+        
+        return self._clamp(adjusted_half, min_half, max_half)
 
     # ───────── Book builders ─────────
     def _rebuild_books(self, bids: list, asks: list) -> None:
@@ -487,9 +712,8 @@ class Strategy:
                     mk = sgn * (mid - px_fill)  # >0 good, <0 toxic
                     self._markout_ewma = (1 - self._markout_alpha) * self._markout_ewma + self._markout_alpha * mk
 
-                # Dynamic VAR cap (shrinks as vol rises)
-                vol_in_ticks = (self._diff_std or 0.0) / max(self.tick_size, 1e-9)
-                pos_cap_dyn = max(self.min_pos_cap, self.base_pos_cap / max(1.0, vol_in_ticks))
+                # Dynamic VAR cap (shrinks as vol rises) - NOW WITH TIME DECAY
+                pos_cap_dyn = self._get_time_adjusted_position_cap()
 
                 # Compute half/center/size per regime
                 if self.regime == "VOL":
@@ -519,6 +743,9 @@ class Strategy:
                     center_skew_ticks = mom_skew_ticks + (- self.inv_skew_per_unit * self.position)
                     size_scale = 1.0
 
+                # Apply time decay adjustments to spreads
+                half = self._get_time_adjusted_spreads(half)
+
                 # Markout-aware widening: if toxicity (negative EWMA), widen by fraction of its magnitude
                 markout_penalty = max(0.0, -self._markout_ewma)
                 if markout_penalty > 0:
@@ -543,6 +770,9 @@ class Strategy:
                 ask_qty = self._clamp(self.base_qty * (1.0 + max(0.0,  imb)), 1.0, self.max_qty)
                 bid_qty = max(self._sanity_qty, bid_qty * size_scale)
                 ask_qty = max(self._sanity_qty, ask_qty * size_scale)
+
+                # Apply time decay adjustments to sizes
+                bid_qty, ask_qty = self._get_time_adjusted_sizing(bid_qty, ask_qty)
 
                 # Replace only when needed
                 def needs_replace(prev_px: Optional[float], new_px: float) -> bool:
@@ -587,6 +817,12 @@ class Strategy:
         except Exception:
             self._last_event_ts = time.time()
 
+        # Initialize timing on first event
+        self._initialize_event_timing()
+        
+        # Update game context with timing information
+        self._update_game_context(**kwargs)
+
         home_score = kwargs.get("home_score")
         away_score = kwargs.get("away_score")
         try:
@@ -615,6 +851,17 @@ class Strategy:
                 self._last_score_sum = curr_sum
         except Exception:
             pass
+
+        # Log current risk state periodically
+        if time.time() - self._last_risk_log > 60:  # Every minute
+            self._last_risk_log = time.time()
+            multipliers = self._calculate_time_decay_multipliers()
+            progress = multipliers["time_progress"]
+            pos_cap = self._get_time_adjusted_position_cap()
+            print(f"Time-decay Risk: Progress={progress:.2%}, Phase={self.game_phase}, "
+                  f"PosCap={pos_cap:.1f}, Pos={self.position:.1f}, "
+                  f"Mults: pos={multipliers['position_mult']:.2f}, "
+                  f"size={multipliers['size_mult']:.2f}, spread={multipliers['spread_mult']:.2f}")
 
     def on_account_update(self, *args, **kwargs) -> None:
         payload = args[0] if args and isinstance(args[0], dict) else (kwargs or {})
@@ -700,6 +947,3 @@ class Strategy:
             except Exception:
                 pass
 
-#17.4k
-#14.6k
-#17.0k

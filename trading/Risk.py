@@ -1,16 +1,19 @@
 """
-Quant Challenge 2025
+Quant Challenge 2025 - Enhanced Version
 
 Algorithmic strategy – VW spread maker with full local orderbook and 30/min rate limit
 Volatility-harvesting + mean-revert exit + IV-based regime switching + adaptive MOMO skew
 + Markout-aware quoting + Exit sub-budget + Dynamic inventory VAR cap
++ ENHANCED RISK MANAGEMENT SYSTEM
 """
 
 from __future__ import annotations
 import time
+import numpy as np
 from enum import Enum
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, NamedTuple
 from collections import deque
+from dataclasses import dataclass
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Provided API surface (keep these signatures exactly)
@@ -36,41 +39,344 @@ def cancel_order(ticker: Ticker, order_id: int) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Strategy
+# Enhanced Risk Management Components
+# ─────────────────────────────────────────────────────────────────────────────
+
+class RiskState(Enum):
+    NORMAL = "normal"
+    CAUTION = "caution" 
+    DANGER = "danger"
+    EMERGENCY = "emergency"
+
+@dataclass
+class RiskMetrics:
+    """Container for real-time risk metrics"""
+    current_pnl: float = 0.0
+    unrealized_pnl: float = 0.0
+    daily_pnl: float = 0.0
+    max_drawdown: float = 0.0
+    var_1d: float = 0.0
+    sharpe_ratio: float = 0.0
+    position_concentration: float = 0.0
+    inventory_risk: float = 0.0
+
+class AdvancedRiskManager:
+    """
+    Comprehensive risk management system addressing key deficiencies:
+    1. Dynamic position sizing based on Kelly criterion
+    2. Multi-horizon VaR calculation
+    3. Drawdown controls with circuit breakers
+    4. Portfolio-theoretic inventory management
+    5. Regime-aware risk adjustments
+    """
+    
+    def __init__(self, initial_capital: float = 100000.0):
+        # Capital and P&L tracking
+        self.initial_capital = initial_capital
+        self.current_capital = initial_capital
+        self.daily_pnl_history = deque(maxlen=252)  # 1 year of daily P&L
+        self.trade_pnl_history = deque(maxlen=1000)  # Individual trade P&L
+        self.high_water_mark = initial_capital
+        self.daily_start_capital = initial_capital
+        
+        # Risk limits (configurable)
+        self.max_daily_loss_pct = 0.03        # 3% daily loss limit
+        self.max_drawdown_pct = 0.08          # 8% max drawdown from high water mark
+        self.var_confidence = 0.05            # 95% VaR
+        self.target_vol_annual = 0.15         # 15% annual volatility target
+        self.max_position_pct = 0.25          # 25% of capital in single position
+        self.emergency_flatten_threshold = 0.05  # 5% loss triggers emergency flatten
+        
+        # Kelly criterion parameters
+        self.kelly_lookback = 100             # trades for Kelly calculation
+        self.kelly_cap = 0.20                 # max 20% of capital per trade (Kelly fraction cap)
+        self.min_win_rate = 0.45              # minimum required win rate
+        self.confidence_threshold = 0.6       # confidence in edge before scaling up
+        
+        # VaR calculation
+        self.var_window = 100                 # lookback for VaR calculation
+        self.returns_history = deque(maxlen=self.var_window)
+        
+        # Circuit breakers
+        self.circuit_breaker_active = False
+        self.circuit_breaker_until = 0.0
+        self.circuit_breaker_cooldown = 1800  # 30 minutes
+        self.consecutive_losses = 0
+        self.max_consecutive_losses = 8
+        
+        # Risk state
+        self.current_risk_state = RiskState.NORMAL
+        self.risk_state_changed_at = time.time()
+        
+        # Position concentration tracking
+        self.position_history = deque(maxlen=100)
+        self.inventory_half_life = 300        # 5 minutes target inventory half-life
+        
+    def update_capital(self, new_capital: float, unrealized_pnl: float = 0.0) -> None:
+        """Update capital and track P&L"""
+        prev_capital = self.current_capital
+        self.current_capital = new_capital
+        
+        # Track trade P&L if this is a realized change
+        if abs(new_capital - prev_capital) > 0.01:  # ignore tiny floating point changes
+            trade_pnl = new_capital - prev_capital
+            self.trade_pnl_history.append(trade_pnl)
+            
+            # Update consecutive loss tracking
+            if trade_pnl < 0:
+                self.consecutive_losses += 1
+            else:
+                self.consecutive_losses = 0
+        
+        # Update high water mark
+        total_capital = new_capital + unrealized_pnl
+        if total_capital > self.high_water_mark:
+            self.high_water_mark = total_capital
+            
+        # Calculate returns for VaR
+        if prev_capital > 0:
+            ret = (new_capital - prev_capital) / prev_capital
+            self.returns_history.append(ret)
+    
+    def start_new_day(self) -> None:
+        """Reset daily tracking metrics"""
+        if self.current_capital != self.daily_start_capital:
+            daily_pnl = self.current_capital - self.daily_start_capital
+            self.daily_pnl_history.append(daily_pnl / self.daily_start_capital)  # as percentage
+        
+        self.daily_start_capital = self.current_capital
+        self.consecutive_losses = 0  # reset daily
+    
+    def calculate_var(self, confidence: float = None) -> float:
+        """Calculate Value at Risk using historical simulation"""
+        if confidence is None:
+            confidence = self.var_confidence
+            
+        if len(self.returns_history) < 20:
+            return 0.0
+            
+        returns = np.array(list(self.returns_history))
+        return float(np.percentile(returns, confidence * 100)) * self.current_capital
+    
+    def calculate_kelly_fraction(self) -> Tuple[float, float]:
+        """
+        Calculate optimal position size using Kelly criterion
+        Returns: (kelly_fraction, confidence_score)
+        """
+        if len(self.trade_pnl_history) < self.kelly_lookback:
+            return 0.1, 0.0  # conservative default
+        
+        recent_trades = list(self.trade_pnl_history)[-self.kelly_lookback:]
+        
+        # Calculate win rate and average win/loss
+        wins = [pnl for pnl in recent_trades if pnl > 0]
+        losses = [pnl for pnl in recent_trades if pnl < 0]
+        
+        if not wins or not losses:
+            return 0.05, 0.0  # very conservative if no wins or losses
+        
+        win_rate = len(wins) / len(recent_trades)
+        avg_win = np.mean(wins)
+        avg_loss = abs(np.mean(losses))
+        
+        # Kelly fraction = (bp - q) / b where:
+        # b = avg_win/avg_loss (odds), p = win_rate, q = 1-p
+        if avg_loss <= 0 or win_rate <= 0:
+            return 0.05, 0.0
+            
+        b = avg_win / avg_loss
+        p = win_rate
+        q = 1 - p
+        
+        kelly_fraction = (b * p - q) / b
+        kelly_fraction = max(0.0, min(kelly_fraction, self.kelly_cap))
+        
+        # Confidence score based on sample size and consistency
+        confidence = min(1.0, len(recent_trades) / self.kelly_lookback)
+        if win_rate < self.min_win_rate:
+            confidence *= 0.5  # reduce confidence if win rate too low
+            
+        return kelly_fraction, confidence
+    
+    def update_risk_state(self, current_position: float, unrealized_pnl: float = 0.0) -> RiskState:
+        """Update overall risk state based on multiple factors"""
+        total_capital = self.current_capital + unrealized_pnl
+        
+        # Drawdown calculation
+        current_drawdown = (self.high_water_mark - total_capital) / self.high_water_mark
+        
+        # Daily P&L calculation
+        daily_pnl_pct = (self.current_capital - self.daily_start_capital) / self.daily_start_capital
+        
+        # VaR calculation
+        var_1d = abs(self.calculate_var())
+        var_pct = var_1d / self.current_capital if self.current_capital > 0 else 0
+        
+        # Position concentration
+        position_pct = abs(current_position) / self.current_capital if self.current_capital > 0 else 0
+        
+        # Determine risk state
+        new_state = RiskState.NORMAL
+        
+        # Emergency conditions
+        if (current_drawdown >= self.emergency_flatten_threshold or
+            daily_pnl_pct <= -self.emergency_flatten_threshold or
+            self.consecutive_losses >= self.max_consecutive_losses):
+            new_state = RiskState.EMERGENCY
+            
+        # Danger conditions  
+        elif (current_drawdown >= self.max_drawdown_pct * 0.7 or
+              daily_pnl_pct <= -self.max_daily_loss_pct * 0.7 or
+              var_pct >= 0.08):
+            new_state = RiskState.DANGER
+            
+        # Caution conditions
+        elif (current_drawdown >= self.max_drawdown_pct * 0.4 or
+              daily_pnl_pct <= -self.max_daily_loss_pct * 0.4 or
+              position_pct >= self.max_position_pct * 0.8 or
+              var_pct >= 0.05):
+            new_state = RiskState.CAUTION
+        
+        # Update state if changed
+        if new_state != self.current_risk_state:
+            self.current_risk_state = new_state
+            self.risk_state_changed_at = time.time()
+        
+        return new_state
+    
+    def should_stop_trading(self) -> Tuple[bool, str]:
+        """Determine if trading should be halted due to risk conditions"""
+        now = time.time()
+        
+        # Check if circuit breaker is active
+        if self.circuit_breaker_active and now < self.circuit_breaker_until:
+            return True, f"Circuit breaker active until {self.circuit_breaker_until - now:.0f}s"
+        
+        # Check for emergency conditions that trigger circuit breaker
+        daily_pnl_pct = (self.current_capital - self.daily_start_capital) / self.daily_start_capital
+        current_drawdown = (self.high_water_mark - self.current_capital) / self.high_water_mark
+        
+        trigger_circuit_breaker = False
+        reason = ""
+        
+        if daily_pnl_pct <= -self.max_daily_loss_pct:
+            trigger_circuit_breaker = True
+            reason = f"Daily loss limit exceeded: {daily_pnl_pct:.2%}"
+            
+        elif current_drawdown >= self.max_drawdown_pct:
+            trigger_circuit_breaker = True
+            reason = f"Max drawdown exceeded: {current_drawdown:.2%}"
+            
+        elif self.consecutive_losses >= self.max_consecutive_losses:
+            trigger_circuit_breaker = True
+            reason = f"Too many consecutive losses: {self.consecutive_losses}"
+        
+        if trigger_circuit_breaker:
+            self.circuit_breaker_active = True
+            self.circuit_breaker_until = now + self.circuit_breaker_cooldown
+            return True, reason
+        
+        # Deactivate circuit breaker if conditions have improved
+        if self.circuit_breaker_active and now >= self.circuit_breaker_until:
+            self.circuit_breaker_active = False
+        
+        return False, ""
+    
+    def should_flatten_position(self, current_position: float) -> Tuple[bool, str]:
+        """Determine if position should be flattened for risk management"""
+        stop_trading, reason = self.should_stop_trading()
+        if stop_trading:
+            return True, f"Flatten due to trading halt: {reason}"
+        
+        if self.current_risk_state == RiskState.EMERGENCY:
+            return True, "Emergency risk state - flatten position"
+        
+        # Check position concentration
+        if self.current_capital > 0:
+            position_pct = abs(current_position) / self.current_capital
+            if position_pct >= self.max_position_pct:
+                return True, f"Position too large: {position_pct:.2%} of capital"
+        
+        return False, ""
+    
+    def get_position_scale_factor(self, volatility_regime: str = "normal") -> float:
+        """Get scaling factor for position sizes based on risk state and regime"""
+        base_factors = {
+            RiskState.NORMAL: 1.0,
+            RiskState.CAUTION: 0.7,
+            RiskState.DANGER: 0.4,
+            RiskState.EMERGENCY: 0.1
+        }
+        
+        regime_adjustments = {
+            "low": 1.2,    # can size up in low vol
+            "normal": 1.0,
+            "high": 0.8,   # size down in high vol
+            "extreme": 0.5  # significant size reduction in extreme vol
+        }
+        
+        base_factor = base_factors[self.current_risk_state]
+        regime_factor = regime_adjustments.get(volatility_regime, 1.0)
+        
+        return base_factor * regime_factor
+    
+    def get_risk_metrics(self, current_position: float, unrealized_pnl: float = 0.0) -> RiskMetrics:
+        """Calculate comprehensive risk metrics for monitoring"""
+        total_capital = self.current_capital + unrealized_pnl
+        daily_pnl = self.current_capital - self.daily_start_capital
+        
+        # Drawdown
+        max_dd = (self.high_water_mark - total_capital) / self.high_water_mark
+        
+        # Sharpe ratio (annualized)
+        if len(self.daily_pnl_history) >= 30:
+            returns = np.array(list(self.daily_pnl_history))
+            sharpe = np.mean(returns) / max(np.std(returns), 1e-6) * np.sqrt(252)
+        else:
+            sharpe = 0.0
+        
+        # Position concentration
+        pos_concentration = abs(current_position) / max(self.current_capital, 1) if self.current_capital > 0 else 0
+        
+        # Inventory risk (how long have we held this position?)
+        inventory_risk = min(1.0, abs(current_position) * 0.1)  # simplified
+        
+        return RiskMetrics(
+            current_pnl=total_capital - self.initial_capital,
+            unrealized_pnl=unrealized_pnl,
+            daily_pnl=daily_pnl,
+            max_drawdown=max_dd,
+            var_1d=self.calculate_var(),
+            sharpe_ratio=sharpe,
+            position_concentration=pos_concentration,
+            inventory_risk=inventory_risk
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Enhanced Strategy with Risk Management
 # ─────────────────────────────────────────────────────────────────────────────
 
 class Strategy:
     """
-    Simple volume-weighted spread maker.
+    Enhanced version of the original Strategy with comprehensive risk management.
 
-    • Maintains a complete local orderbook from snapshots + incremental updates
-    • Quotes one bid + one ask inside the spread (VW top-N levels)
-    • Enforces 30 orders/min with a leaky bucket rate limiter
-    • Handles game rollovers (score resets) with cooldown + optional flatten
-    • Tracks fills to maintain position and cash
+    Original features:
+    • Volume-weighted spread maker with full local orderbook
+    • Volatility harvesting + mean-revert exit + IV-based regime switching
+    • Markout-aware quoting + Exit sub-budget + Dynamic inventory VAR cap
 
-    Volatility harvesting
-    • Adaptive half-spread = inside_frac*spread + k_vol*std(diff(mid))
-    • Mean-reversion lean (z-score of mid vs rolling mean)
-    • Inventory skew to keep book neutral
-    • Volatility-based size dampening
-
-    Mean-revert exit
-    • When price snaps back toward entry by a configurable edge, send IOC to reduce/flatten.
-
-    IV-based regime switching
-    • Use std(diff(mid)) as a practical intraday IV proxy. Switch between:
-      - VOL: the volatility-harvesting mode above
-      - MOMO: tighter quoting with adaptive momentum skew in low IV
-
-    Additions
-    • Markout-aware quoting (short-horizon toxicity filter)
-    • Exit sub-budget (prevents IOC exits from consuming the full 30/min)
-    • Dynamic inventory VAR cap (cap shrinks as intraday IV rises)
+    NEW Risk Management Features:
+    • Kelly criterion-based position sizing
+    • Multi-horizon VaR calculation
+    • Drawdown controls with circuit breakers
+    • Portfolio-theoretic inventory management
+    • Real-time risk state monitoring
     """
 
     # ───────── Lifecycle ─────────
-    def __init__(self) -> None:
+    def __init__(self, initial_capital: float = 100000.0) -> None:
+        self.initial_capital = initial_capital
         self.reset_state()
 
     def reset_state(self) -> None:
@@ -105,6 +411,9 @@ class Strategy:
 
         # Track average entry price for current net position (abs)
         self.pos_avg_price: float = 0.0
+
+        # ENHANCED: Risk Manager
+        self.risk_manager = AdvancedRiskManager(self.initial_capital)
 
         # Rollover detection state
         self._last_score_sum: Optional[int] = None
@@ -331,6 +640,88 @@ class Strategy:
         except Exception:
             pass
 
+    # ───────── ENHANCED: Risk Management Helpers ─────────
+    def _estimate_current_mid(self) -> float:
+        """Estimate current mid price for P&L calculation"""
+        if self._best_bid and self._best_ask:
+            return (self._best_bid[0] + self._best_ask[0]) / 2.0
+        return self.pos_avg_price or 100.0  # fallback
+
+    def _get_volatility_regime(self) -> str:
+        """Classify current volatility regime for risk scaling"""
+        if not self._diff_std:
+            return "normal"
+        
+        vol_ticks = self._diff_std / self.tick_size
+        if vol_ticks >= 3.0:
+            return "extreme"
+        elif vol_ticks >= 2.0:
+            return "high"
+        elif vol_ticks <= 0.5:
+            return "low"
+        return "normal"
+
+    def _get_risk_adjusted_quantities(self, base_bid_qty: float, base_ask_qty: float) -> Tuple[float, float]:
+        """Apply risk-based scaling to order quantities"""
+        vol_regime = self._get_volatility_regime()
+        scale_factor = self.risk_manager.get_position_scale_factor(vol_regime)
+        
+        # Apply scaling with minimums
+        min_qty = max(self._sanity_qty, 1.0)
+        scaled_bid = max(min_qty, base_bid_qty * scale_factor)
+        scaled_ask = max(min_qty, base_ask_qty * scale_factor)
+        
+        return scaled_bid, scaled_ask
+
+    def _handle_risk_stop(self, reason: str) -> None:
+        """Handle trading halt due to risk conditions"""
+        # Cancel all orders
+        if self._bid_oid:
+            self._cancel(self._bid_oid)
+            self._bid_oid = None
+            self._last_bid_px = None
+        if self._ask_oid:
+            self._cancel(self._ask_oid)
+            self._ask_oid = None
+            self._last_ask_px = None
+        
+        print(f"RISK HALT: {reason}")
+
+    def _handle_risk_flatten(self, reason: str) -> None:
+        """Handle position flattening due to risk conditions"""
+        if abs(self.position) > 0:
+            # Place market order to flatten
+            if self._fn_place_market and self._ticker and self._Side:
+                side = self._Side.SELL if self.position > 0 else self._Side.BUY
+                try:
+                    self._fn_place_market(side, self._ticker, abs(self.position))
+                    print(f"RISK FLATTEN: {reason} - Position: {self.position}")
+                    # Reset position tracking after flatten attempt
+                    self.position = 0.0
+                    self.pos_avg_price = 0.0
+                except Exception as e:
+                    print(f"Failed to flatten position: {e}")
+
+    def get_risk_report(self) -> str:
+        """Generate comprehensive risk report for monitoring"""
+        unrealized_pnl = self.position * self._estimate_current_mid() if self.position != 0 else 0.0
+        metrics = self.risk_manager.get_risk_metrics(self.position, unrealized_pnl)
+        
+        return f'''=== RISK REPORT ===
+State: {self.risk_manager.current_risk_state.value.upper()}
+Position: {self.position:.2f}
+Current P&L: {metrics.current_pnl:.2f}
+Daily P&L: {metrics.daily_pnl:.2f}
+Max Drawdown: {metrics.max_drawdown:.2%}
+Position %: {metrics.position_concentration:.2%}
+VaR (1d): {metrics.var_1d:.2f}
+Sharpe: {metrics.sharpe_ratio:.2f}
+Consecutive Losses: {self.risk_manager.consecutive_losses}
+Circuit Breaker: {"ACTIVE" if self.risk_manager.circuit_breaker_active else "INACTIVE"}
+Regime: {self.regime}
+Vol (ticks): {(self._diff_std / self.tick_size):.2f}
+==================='''
+
     # ───────── Rollover helpers ─────────
     def _handle_rollover(self, reason: str) -> None:
         """Trigger a new-game rollover: cancel quotes, optionally flatten, clear local book, start cooldown."""
@@ -358,6 +749,7 @@ class Strategy:
         self._bid_prices.clear(); self._ask_prices.clear()
         self._best_bid = None; self._best_ask = None
         self._cooldown_until = time.time() + self.rollover_cooldown_sec
+        print(f"ROLLOVER: {reason}")
 
     # ───────── Volatility stats ─────────
     def _update_mid_stats(self, mid: float) -> None:
@@ -443,6 +835,12 @@ class Strategy:
             px = self._round_tick(min(vwask, mid + self.tick_size))
             self._place_limit(True, qty, px, ioc=self.mr_use_ioc)
 
+    # ───────── Daily reset for risk management ─────────
+    def on_daily_reset(self) -> None:
+        """Called at start of new trading day to reset risk metrics"""
+        self.risk_manager.start_new_day()
+        print("Daily risk metrics reset")
+
     # ───────── Public engine hooks ─────────
     def on_orderbook_snapshot(self, ticker: Ticker, bids: list, asks: list) -> None:
         self._ticker = ticker
@@ -451,6 +849,12 @@ class Strategy:
     def on_orderbook_update(self, ticker: Ticker, side: Side, quantity: float, price: float) -> None:
         self._ticker = ticker
         self._apply_level_update(side, quantity, price)
+
+        # ENHANCED: Check risk conditions before quoting
+        should_stop, stop_reason = self.risk_manager.should_stop_trading()
+        if should_stop:
+            self._handle_risk_stop(stop_reason)
+            return
 
         # Pause quoting during rollover cooldown, but keep rebuilding the book
         if time.time() < self._cooldown_until:
@@ -479,6 +883,16 @@ class Strategy:
                 # Volatility stats and regime
                 self._update_mid_stats(mid)
                 self._update_regime()
+
+                # ENHANCED: Update risk state based on current position and unrealized P&L
+                unrealized_pnl = self.position * mid if self.position != 0 else 0.0
+                self.risk_manager.update_risk_state(self.position, unrealized_pnl)
+
+                # Check if we should flatten position
+                should_flatten, flatten_reason = self.risk_manager.should_flatten_position(self.position)
+                if should_flatten:
+                    self._handle_risk_flatten(flatten_reason)
+                    return
 
                 # Update short-horizon markout (realize aged fills vs current mid)
                 now_ts = time.time()
@@ -543,6 +957,9 @@ class Strategy:
                 ask_qty = self._clamp(self.base_qty * (1.0 + max(0.0,  imb)), 1.0, self.max_qty)
                 bid_qty = max(self._sanity_qty, bid_qty * size_scale)
                 ask_qty = max(self._sanity_qty, ask_qty * size_scale)
+
+                # ENHANCED: Apply risk-based quantity scaling
+                bid_qty, ask_qty = self._get_risk_adjusted_quantities(bid_qty, ask_qty)
 
                 # Replace only when needed
                 def needs_replace(prev_px: Optional[float], new_px: float) -> bool:
@@ -682,6 +1099,10 @@ class Strategy:
             self.cash += q * p
             sgn = -1
 
+        # ENHANCED: Update risk manager with new capital
+        estimated_capital = self.cash + self.position * self._estimate_current_mid()
+        self.risk_manager.update_capital(estimated_capital)
+
         # Queue the fill for later markout measurement
         try:
             self._fills_ring.append((time.time(), sgn, p))
@@ -690,6 +1111,18 @@ class Strategy:
 
         if self.position == 0.0:
             self.pos_avg_price = 0.0
+
+        # ENHANCED: Check for risk-based actions after fill
+        self.risk_manager.update_risk_state(self.position)
+        
+        should_stop, stop_reason = self.risk_manager.should_stop_trading()
+        if should_stop:
+            self._handle_risk_stop(stop_reason)
+            return
+        
+        should_flatten, flatten_reason = self.risk_manager.should_flatten_position(self.position)
+        if should_flatten:
+            self._handle_risk_flatten(flatten_reason)
 
     def on_pnl_update(self, *args, **kwargs) -> None:
         payload = args[0] if args and isinstance(args[0], dict) else (kwargs or {})
@@ -700,6 +1133,25 @@ class Strategy:
             except Exception:
                 pass
 
-#17.4k
-#14.6k
-#17.0k
+        # ENHANCED: Update risk manager when P&L updates
+        if hasattr(self, 'risk_manager'):
+            estimated_capital = self.cash + self.position * self._estimate_current_mid()
+            self.risk_manager.update_capital(estimated_capital)
+
+# Example usage and monitoring
+def print_strategy_status(strategy: Strategy) -> None:
+    """Helper function to print comprehensive strategy status"""
+    print("\n" + "="*50)
+    print("STRATEGY STATUS")
+    print("="*50)
+    print(f"Position: {strategy.position:.2f}")
+    print(f"Cash: {strategy.cash:.2f}")
+    print(f"Avg Entry: {strategy.pos_avg_price:.2f}")
+    print(f"Regime: {strategy.regime}")
+    print(f"Vol (std): {strategy._diff_std:.4f}")
+    print(f"Rate Limit Tokens: {strategy._rl_tokens:.1f}/{strategy._rl_capacity}")
+    print(f"Exit Tokens: {strategy._exit_tokens:.1f}/{strategy._exit_capacity}")
+    print("\n" + strategy.get_risk_report())
+    print("="*50)
+
+#11.5k

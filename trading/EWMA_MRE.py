@@ -2,8 +2,8 @@
 Quant Challenge 2025
 
 Algorithmic strategy – VW spread maker with full local orderbook and 30/min rate limit
-Volatility-harvesting + mean-revert exit + IV-based regime switching + adaptive MOMO skew
-+ Markout-aware quoting + Exit sub-budget + Dynamic inventory VAR cap
+Volatility-harvesting + mean-revert exit (coupled to markout) + IV-based regime switching
++ adaptive MOMO skew + Markout-aware quoting + Exit sub-budget + Dynamic inventory VAR cap
 """
 
 from __future__ import annotations
@@ -41,32 +41,15 @@ def cancel_order(ticker: Ticker, order_id: int) -> bool:
 
 class Strategy:
     """
-    Simple volume-weighted spread maker.
-
-    • Maintains a complete local orderbook from snapshots + incremental updates
-    • Quotes one bid + one ask inside the spread (VW top-N levels)
-    • Enforces 30 orders/min with a leaky bucket rate limiter
-    • Handles game rollovers (score resets) with cooldown + optional flatten
-    • Tracks fills to maintain position and cash
-
-    Volatility harvesting
-    • Adaptive half-spread = inside_frac*spread + k_vol*std(diff(mid))
-    • Mean-reversion lean (z-score of mid vs rolling mean)
-    • Inventory skew to keep book neutral
-    • Volatility-based size dampening
-
-    Mean-revert exit
-    • When price snaps back toward entry by a configurable edge, send IOC to reduce/flatten.
-
-    IV-based regime switching
-    • Use std(diff(mid)) as a practical intraday IV proxy. Switch between:
-      - VOL: the volatility-harvesting mode above
-      - MOMO: tighter quoting with adaptive momentum skew in low IV
-
-    Additions
-    • Markout-aware quoting (short-horizon toxicity filter)
-    • Exit sub-budget (prevents IOC exits from consuming the full 30/min)
-    • Dynamic inventory VAR cap (cap shrinks as intraday IV rises)
+    Simple volume-weighted spread maker with:
+      • Local orderbook, VW quotes, 30/min rate limit
+      • Rollover safety and optional flatten
+      • VOL regime: volatility-harvesting (adaptive half-spread, z-lean, size dampen)
+      • MOMO regime: tight quotes + adaptive momentum skew in low IV
+      • Mean-revert IOC exits (now markout-coupled)
+      • Markout-aware widening (toxicity filter)
+      • Exit sub-budget (prevents starving quoting)
+      • Dynamic inventory VAR cap (shrinks as IV rises)
     """
 
     # ───────── Lifecycle ─────────
@@ -113,52 +96,57 @@ class Strategy:
         self._last_event_ts: Optional[float] = None
 
         # Rollover knobs (tune)
-        self.rollover_cooldown_sec: float = 4.0    # seconds to pause quoting
-        self.min_drop: int = 20                    # absolute score drop to flag rollover
-        self.frac_drop: float = 0.40               # fractional drop threshold
-        self.z_sigma: float = 4.0                  # z-score threshold for unusual negative jump
-        self.flatten_on_rollover: bool = True      # flatten inventory on rollover
+        self.rollover_cooldown_sec: float = 4.0
+        self.min_drop: int = 20
+        self.frac_drop: float = 0.40
+        self.z_sigma: float = 4.0
+        self.flatten_on_rollover: bool = True
 
         # Quoting params (tune safely)
         self.depth: int = 5                 # VW over top N levels
-        self.inside_frac: float = 0.25      # fraction of spread toward mid
-        self.base_qty: float = 5.0          # base order size
-        self.max_qty: float = 20.0          # cap by imbalance scaling
-        self.tick_size: float = 0.5         # price tick granularity
-        self.price_epsilon: float = 0.01    # min change to replace
+        self.inside_frac: float = 0.25
+        self.base_qty: float = 5.0
+        self.max_qty: float = 20.0
+        self.tick_size: float = 0.5
+        self.price_epsilon: float = 0.01
 
         # Volatility-harvesting controls
-        self.vol_window: int = 60            # number of mid observations for rolling stats
-        self.k_vol: float = 1.25             # half-spread add-on = k_vol * std(diff(mid))
-        self.min_inside_ticks: float = 1.0   # floor for half-spread in ticks
-        self.max_inside_ticks: float = 8.0   # cap for half-spread in ticks
-        self.z_lean: float = 0.35            # lean against deviations (z-score of mid vs mean)
-        self.inv_skew_per_unit: float = 0.05 # additional skew per 1 unit inventory (in ticks)
-        self.qty_vol_dampen: float = 0.5     # damp sizes when vol is high (0=no damp, 1=strong)
+        self.vol_window: int = 60
+        self.k_vol: float = 1.25
+        self.min_inside_ticks: float = 1.0
+        self.max_inside_ticks: float = 8.0
+        self.z_lean: float = 0.35
+        self.inv_skew_per_unit: float = 0.05
+        self.qty_vol_dampen: float = 0.5
 
         # Mean-revert exit controls
-        self.mr_sigma_take: float = 0.5      # trigger when move vs entry >= 0.5 * std(diff(mid))
-        self.mr_min_edge_ticks: float = 0.5  # at least this many ticks of edge
-        self.mr_clip: float = 10.0           # max qty to reduce per check
-        self.mr_use_ioc: bool = True         # IOC so we don't rest during exit
+        self.mr_sigma_take: float = 0.5
+        self.mr_min_edge_ticks: float = 0.5
+        self.mr_clip: float = 10.0
+        self.mr_use_ioc: bool = True
+
+        # Coupling: markout → mean-revert exit sensitivity (NEW)
+        self.mr_markout_coupling: float = 0.6      # strength of coupling [0..1+]
+        self.mr_edge_floor_ticks_min: float = 0.25 # absolute floor to avoid micro-churn
+        self.mr_markout_cap_ticks: float = 1.5     # cap markout impact (ticks)
 
         # IV-based regime controls
         self.iv_high_thresh_ticks: float = 2.0   # high IV if _diff_std/tick_size >= 2
-        self.iv_low_thresh_ticks: float  = 1.0   # low IV if <= 1 (hysteresis band 1..2)
+        self.iv_low_thresh_ticks: float  = 1.0   # low IV if <= 1
         self.regime: str = "VOL"                 # "VOL" or "MOMO"
         self.min_regime_hold_sec: float = 20.0
         self._last_regime_switch: float = 0.0
 
         # MOMO mode controls (for low IV)
-        self.momo_half_ticks: float = 1.5        # tighter quoting in low IV
-        self.momo_skew: float = 0.20             # (legacy; not used with adaptive, retained for compat)
-        self.momo_pos_cap: float = 25.0          # legacy cap; kept for reference
+        self.momo_half_ticks: float = 1.5
+        self.momo_skew: float = 0.20             # legacy; not used when adaptive is on
+        self.momo_pos_cap: float = 25.0          # legacy cap; retained for reference
 
         # MOMO adaptive momentum
         self.momo_mom_window: int = 8            # lookback (# mids → #diffs = window-1)
-        self.momo_mom_decay: float = 0.7         # EWMA decay for recent diffs
-        self.momo_skew_gain: float = 0.35        # ticks of skew per 1.0 unit signal
-        self.momo_skew_max_ticks: float = 2.0    # cap skew magnitude (ticks)
+        self.momo_mom_decay: float = 0.7         # EWMA decay
+        self.momo_skew_gain: float = 0.35        # ticks per 1.0 unit signal
+        self.momo_skew_max_ticks: float = 2.0    # cap skew
 
         # Markout-aware quoting (toxicity filter)
         self._markout_ewma: float = 0.0          # >0 good, <0 toxic
@@ -175,7 +163,7 @@ class Strategy:
 
         # Dynamic inventory VAR cap
         self.base_pos_cap: float = 60.0          # position units at ~1 tick vol
-        self.min_pos_cap: float = 10.0           # never go below this
+        self.min_pos_cap: float = 10.0
         self.varcap_flatten_bias: float = 0.5    # size scale when beyond cap
 
         # Rolling mid stats
@@ -201,16 +189,11 @@ class Strategy:
     # ───────── Engine resolution helpers ─────────
     def _ensure_api(self) -> None:
         g = globals()
-        if self._Side is None:
-            self._Side = g.get("Side", None)
-        if self._Ticker is None:
-            self._Ticker = g.get("Ticker", None)
-        if self._fn_place_market is None:
-            self._fn_place_market = g.get("place_market_order", None)
-        if self._fn_place_limit is None:
-            self._fn_place_limit = g.get("place_limit_order", None)
-        if self._fn_cancel is None:
-            self._fn_cancel = g.get("cancel_order", None)
+        if self._Side is None:   self._Side = g.get("Side", None)
+        if self._Ticker is None: self._Ticker = g.get("Ticker", None)
+        if self._fn_place_market is None: self._fn_place_market = g.get("place_market_order", None)
+        if self._fn_place_limit is None:  self._fn_place_limit  = g.get("place_limit_order", None)
+        if self._fn_cancel is None:       self._fn_cancel       = g.get("cancel_order", None)
 
     def _ensure_ticker(self) -> None:
         if self._ticker is None:
@@ -218,7 +201,7 @@ class Strategy:
             if self._Ticker is not None and hasattr(self._Ticker, "TEAM_A"):
                 self._ticker = getattr(self._Ticker, "TEAM_A")
 
-    # ───────── Rate limit: 30/min (leaky bucket) ─────────
+    # ───────── Rate limiters ─────────
     def _rl_allow(self, cost: float = 1.0) -> bool:
         now = time.monotonic()
         dt = max(0.0, now - self._rl_last_t)
@@ -229,7 +212,6 @@ class Strategy:
             return True
         return False
 
-    # Exit sub-budget limiter
     def _rl_allow_exit(self, cost: float = 1.0) -> bool:
         now = time.monotonic()
         dt = max(0.0, now - self._exit_last_t)
@@ -240,7 +222,7 @@ class Strategy:
             return True
         return False
 
-    # ───────── Round helpers ─────────
+    # ───────── Utilities ─────────
     def _round_tick(self, px: float) -> float:
         if self.tick_size <= 0:
             return float(px)
@@ -253,7 +235,6 @@ class Strategy:
 
     # ───────── Book builders ─────────
     def _rebuild_books(self, bids: list, asks: list) -> None:
-        """Rebuild the full local book from snapshot arrays of [price, qty]."""
         self._bids.clear(); self._asks.clear()
         self._bid_prices.clear(); self._ask_prices.clear()
 
@@ -272,7 +253,6 @@ class Strategy:
         self._best_ask = (self._ask_prices[0], self._asks[self._ask_prices[0]]) if self._ask_prices else None
 
     def _apply_level_update(self, side: Side, quantity: float, price: float) -> None:
-        """Apply incremental level update to the local book."""
         try:
             p = float(price); q = float(quantity)
         except Exception:
@@ -288,10 +268,8 @@ class Strategy:
         if q <= 0:
             if p in book:
                 del book[p]
-                try:
-                    prices.remove(p)
-                except ValueError:
-                    pass
+                try: prices.remove(p)
+                except ValueError: pass
         else:
             new = p not in book
             book[p] = q
@@ -302,38 +280,27 @@ class Strategy:
         self._best_bid = (self._bid_prices[0], self._bids[self._bid_prices[0]]) if self._bid_prices else None
         self._best_ask = (self._ask_prices[0], self._asks[self._ask_prices[0]]) if self._ask_prices else None
 
-    # ───────── Order helpers ─────────
+    # ───────── Orders ─────────
     def _place_limit(self, want_buy: bool, qty: float, price: float, ioc: bool = False) -> Optional[int]:
         self._ensure_api(); self._ensure_ticker()
-        if not callable(self._fn_place_limit) or self._ticker is None:
-            return None
-        if not self._rl_allow(1.0):
-            return None
-        if self._Side and hasattr(self._Side, "BUY"):
-            side = self._Side.BUY if want_buy else self._Side.SELL
-        else:
-            side = "BUY" if want_buy else "SELL"
+        if not callable(self._fn_place_limit) or self._ticker is None: return None
+        if not self._rl_allow(1.0): return None
+        side = (self._Side.BUY if want_buy else self._Side.SELL) if self._Side else ("BUY" if want_buy else "SELL")
         try:
             return self._fn_place_limit(side, self._ticker, float(qty), float(price), bool(ioc))
         except Exception:
             return None
 
     def _cancel(self, oid: Optional[int]) -> None:
-        if oid is None:
-            return
+        if oid is None: return
         self._ensure_api(); self._ensure_ticker()
-        if not callable(self._fn_cancel) or self._ticker is None:
-            return
-        if not self._rl_allow(1.0):
-            return
-        try:
-            self._fn_cancel(self._ticker, oid)
-        except Exception:
-            pass
+        if not callable(self._fn_cancel) or self._ticker is None: return
+        if not self._rl_allow(1.0): return
+        try: self._fn_cancel(self._ticker, oid)
+        except Exception: pass
 
-    # ───────── Rollover helpers ─────────
+    # ───────── Rollover ─────────
     def _handle_rollover(self, reason: str) -> None:
-        """Trigger a new-game rollover: cancel quotes, optionally flatten, clear local book, start cooldown."""
         if self._bid_oid is not None:
             try: self._cancel(self._bid_oid)
             except Exception: pass
@@ -359,10 +326,9 @@ class Strategy:
         self._best_bid = None; self._best_ask = None
         self._cooldown_until = time.time() + self.rollover_cooldown_sec
 
-    # ───────── Volatility stats ─────────
+    # ───────── Vol stats ─────────
     def _update_mid_stats(self, mid: float) -> None:
-        if mid is None:
-            return
+        if mid is None: return
         if self._mid_hist and self._mid_hist[-1] is not None:
             last_mid = self._mid_hist[-1]
             self._mid_diff_hist.append(float(mid) - float(last_mid))
@@ -423,27 +389,55 @@ class Strategy:
         sig = ewma / max(scale, 1e-9)
         return self._clamp(sig, -3.0, 3.0)
 
-    # ───────── Mean-revert exit helper ─────────
+    # ───────── Mean-revert exit (markout-coupled) ─────────
     def _maybe_mean_revert_exit(self, mid: float, vwbid: float, vwask: float) -> None:
+        """
+        Exit fires earlier when short-horizon EWMA markout is negative (toxic),
+        and later when positive (benign). Respects the exit sub-budget.
+        """
         if self.position == 0:
             return
         if not self._rl_allow_exit(1.0):
-            return  # preserve order budget; quotes will lean to flatten anyway
+            return  # preserve order budget; quotes keep running
 
         sigma_diff = float(self._diff_std or 0.0)
-        edge_abs = max(self.mr_sigma_take * sigma_diff, self.mr_min_edge_ticks * self.tick_size)
+        tick = max(self.tick_size, 1e-9)
+
+        # Map markout to ticks (bounded)
+        neg_markout = max(0.0, -self._markout_ewma)
+        pos_markout = max(0.0,  self._markout_ewma)
+        neg_mk_ticks = min(self.mr_markout_cap_ticks, neg_markout / tick)
+        pos_mk_ticks = min(self.mr_markout_cap_ticks, pos_markout / tick)
+
+        # Adjust sigma multiplier (down with toxicity, up a bit with benign flow)
+        k_down = self.mr_markout_coupling * neg_mk_ticks
+        k_up   = 0.5 * self.mr_markout_coupling * pos_mk_ticks
+        eff_sigma_take = self.mr_sigma_take * (1.0 - k_down + k_up)
+        eff_sigma_take = max(0.10, min(2.0, eff_sigma_take))  # safety clamp
+
+        # Edge floor in price (ticks → px). Lower a bit when toxic, never below hard min.
+        floor_ticks = max(
+            self.mr_edge_floor_ticks_min,
+            self.mr_min_edge_ticks * (1.0 - 0.5 * (neg_mk_ticks / max(1e-9, self.mr_markout_cap_ticks)))
+        )
+        edge_floor_px = floor_ticks * tick
+
+        # Required absolute edge to attempt exit
+        edge_abs = max(eff_sigma_take * sigma_diff, edge_floor_px)
+
         qty = min(abs(self.position), self.mr_clip)
         if qty <= 0:
             return
 
+        # Directional checks vs avg entry
         if self.position > 0 and (mid - self.pos_avg_price) >= edge_abs:
-            px = self._round_tick(max(vwbid, mid - self.tick_size))
+            px = self._round_tick(max(vwbid, mid - tick))
             self._place_limit(False, qty, px, ioc=self.mr_use_ioc)
         elif self.position < 0 and (self.pos_avg_price - mid) >= edge_abs:
-            px = self._round_tick(min(vwask, mid + self.tick_size))
+            px = self._round_tick(min(vwask, mid + tick))
             self._place_limit(True, qty, px, ioc=self.mr_use_ioc)
 
-    # ───────── Public engine hooks ─────────
+    # ───────── Engine hooks ─────────
     def on_orderbook_snapshot(self, ticker: Ticker, bids: list, asks: list) -> None:
         self._ticker = ticker
         self._rebuild_books(bids, asks)
@@ -480,7 +474,7 @@ class Strategy:
                 self._update_mid_stats(mid)
                 self._update_regime()
 
-                # Update short-horizon markout (realize aged fills vs current mid)
+                # Realize short-horizon markout vs current mid
                 now_ts = time.time()
                 while self._fills_ring and now_ts - self._fills_ring[0][0] > self.markout_horizon_sec:
                     _, sgn, px_fill = self._fills_ring.popleft()
@@ -519,7 +513,7 @@ class Strategy:
                     center_skew_ticks = mom_skew_ticks + (- self.inv_skew_per_unit * self.position)
                     size_scale = 1.0
 
-                # Markout-aware widening: if toxicity (negative EWMA), widen by fraction of its magnitude
+                # Markout-aware widening: add when toxicity is negative
                 markout_penalty = max(0.0, -self._markout_ewma)
                 if markout_penalty > 0:
                     half += self._round_tick(self.markout_widen_k * markout_penalty)
@@ -527,7 +521,6 @@ class Strategy:
                 # Extra flatten bias when beyond dynamic cap (reduce sizes too)
                 if abs(self.position) > pos_cap_dyn:
                     size_scale *= self.varcap_flatten_bias
-                    # push center opposite inventory a bit more
                     center_skew_ticks += (- self.inv_skew_per_unit * (self.position / max(1.0, pos_cap_dyn)))
 
                 center_skew = center_skew_ticks * self.tick_size
@@ -568,7 +561,7 @@ class Strategy:
                         self._ask_oid = oid
                         self._last_ask_px = target_ask_px
 
-                # Opportunistic mean-revert exit (IOC, respects exit budget)
+                # Opportunistic mean-revert exit (IOC, exit budget applies)
                 self._maybe_mean_revert_exit(mid, vwbid, vwask)
 
     def on_rejected(self, *args, **kwargs) -> None:
@@ -581,14 +574,12 @@ class Strategy:
             now = kwargs.get("timestamp") or kwargs.get("ts") or kwargs.get("time")
             if now is None:
                 nums = [a for a in args if isinstance(a, (int, float))]
-                if nums:
-                    now = float(nums[-1])
+                if nums: now = float(nums[-1])
             self._last_event_ts = float(now) if now is not None else time.time()
         except Exception:
             self._last_event_ts = time.time()
 
-        home_score = kwargs.get("home_score")
-        away_score = kwargs.get("away_score")
+        home_score = kwargs.get("home_score"); away_score = kwargs.get("away_score")
         try:
             if home_score is not None and away_score is not None:
                 curr_sum = int(home_score) + int(away_score)
@@ -619,20 +610,14 @@ class Strategy:
     def on_account_update(self, *args, **kwargs) -> None:
         payload = args[0] if args and isinstance(args[0], dict) else (kwargs or {})
         try:
-            if payload.get("cash") is not None:
-                self.cash = float(payload["cash"])
-        except Exception:
-            pass
+            if payload.get("cash") is not None: self.cash = float(payload["cash"])
+        except Exception: pass
         try:
-            if payload.get("capital_remaining") is not None:
-                self.capital_remaining = float(payload["capital_remaining"])
-        except Exception:
-            pass
+            if payload.get("capital_remaining") is not None: self.capital_remaining = float(payload["capital_remaining"])
+        except Exception: pass
         try:
-            if payload.get("position") is not None:
-                self.position = float(payload["position"])
-        except Exception:
-            pass
+            if payload.get("position") is not None: self.position = float(payload["position"])
+        except Exception: pass
 
     def on_trade_update(self, *args, **kwargs) -> None:
         return
@@ -646,10 +631,7 @@ class Strategy:
             d = args[0]
             side = d.get("side"); quantity = d.get("quantity"); price = d.get("price")
         else:
-            side = kwargs.get("side")
-            quantity = kwargs.get("quantity")
-            price = kwargs.get("price")
-
+            side = kwargs.get("side"); quantity = kwargs.get("quantity"); price = kwargs.get("price")
         if side is None or quantity is None or price is None:
             return
 
@@ -659,7 +641,6 @@ class Strategy:
             is_buy = str(side).upper() in ("BUY", "BID")
 
         q = float(quantity); p = float(price)
-
         prev_pos = self.position
         new_pos = prev_pos + q if is_buy else prev_pos - q
 
@@ -682,7 +663,7 @@ class Strategy:
             self.cash += q * p
             sgn = -1
 
-        # Queue the fill for later markout measurement
+        # Queue fill for later markout measurement
         try:
             self._fills_ring.append((time.time(), sgn, p))
         except Exception:
@@ -700,6 +681,4 @@ class Strategy:
             except Exception:
                 pass
 
-#17.4k
-#14.6k
-#17.0k
+#11.6k
